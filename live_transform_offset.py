@@ -1,6 +1,23 @@
 import bpy
 from bpy.types import Panel, Operator, PropertyGroup
-from bpy.props import FloatProperty, FloatVectorProperty, BoolProperty, StringProperty
+from bpy.props import FloatVectorProperty, BoolProperty
+from bpy.app.handlers import persistent
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Reliable transform detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _is_transform_running():
+    for window in bpy.context.window_manager.windows:
+        for op in window.modal_operators:
+            if op.bl_idname.startswith("TRANSFORM_OT"):
+                return True
+    return False
+
+
+# Track transition so we can refresh once after a transform ends
+_was_transforming = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -8,7 +25,6 @@ from bpy.props import FloatProperty, FloatVectorProperty, BoolProperty, StringPr
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _iter_channels(bone):
-    """Yield (data_path, array_index, live_value) for every transform channel."""
     name = bone.name
 
     path = f'pose.bones["{name}"].location'
@@ -35,14 +51,6 @@ def _iter_channels(bone):
 
 
 def _get_action_fcurves(action, obj):
-    """Return the FCurves collection driving obj's channels.
-
-    Blender >= 4.4 replaced the flat Action.fcurves layout with layered,
-    per-slot actions (Action.layers -> strips -> channelbags), so the
-    legacy attribute no longer exists. This resolves the right channelbag
-    for the object's assigned action slot, falling back to the legacy
-    attribute on older Blender versions.
-    """
     fcurves = getattr(action, "fcurves", None)
     if fcurves is not None:
         return fcurves
@@ -61,7 +69,6 @@ def _get_action_fcurves(action, obj):
 
 
 def collect_offsets(context):
-    """Return list of (fcurve, offset, data_path, array_index, bone_name)."""
     obj = context.active_object
     if not obj or obj.type != 'ARMATURE' or obj.mode != 'POSE':
         return []
@@ -96,7 +103,6 @@ def collect_offsets(context):
 
 
 def apply_offsets(pending):
-    """Apply the collected offsets to all keyframes."""
     for fc, offset, *_ in pending:
         for kp in fc.keyframe_points:
             kp.co.y += offset
@@ -116,35 +122,36 @@ def get_keyed_value(action, obj, data_path, array_index, frame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PropertyGroup – stores editable offsets for the active bone
+# PropertyGroup – update callbacks only run on real user edits
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _update_loc(self, context):
-    if self.suppress_update:
+    if self.suppress_update or _is_transform_running():
         return
     bone = context.active_pose_bone
     if not bone:
         return
     obj = context.active_object
+    if not obj or not obj.animation_data or not obj.animation_data.action:
+        return
     action = obj.animation_data.action
     frame = context.scene.frame_current
     name = bone.name
 
     for i in range(3):
         keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].location', i, frame)
-        if keyed is not None:
-            bone.location[i] = keyed + self.loc_offset[i]
-        else:
-            bone.location[i] = self.loc_offset[i]
+        bone.location[i] = (keyed + self.loc_offset[i]) if keyed is not None else self.loc_offset[i]
 
 
 def _update_rot(self, context):
-    if self.suppress_update:
+    if self.suppress_update or _is_transform_running():
         return
     bone = context.active_pose_bone
     if not bone:
         return
     obj = context.active_object
+    if not obj or not obj.animation_data or not obj.animation_data.action:
+        return
     action = obj.animation_data.action
     frame = context.scene.frame_current
     name = bone.name
@@ -153,45 +160,35 @@ def _update_rot(self, context):
         path = f'pose.bones["{name}"].rotation_quaternion'
         for i in range(4):
             keyed = get_keyed_value(action, obj, path, i, frame)
-            if keyed is not None:
-                bone.rotation_quaternion[i] = keyed + self.rot_offset[i]
-            else:
-                bone.rotation_quaternion[i] = self.rot_offset[i]
+            bone.rotation_quaternion[i] = (keyed + self.rot_offset[i]) if keyed is not None else self.rot_offset[i]
     elif bone.rotation_mode == 'AXIS_ANGLE':
         path = f'pose.bones["{name}"].rotation_axis_angle'
         for i in range(4):
             keyed = get_keyed_value(action, obj, path, i, frame)
-            if keyed is not None:
-                bone.rotation_axis_angle[i] = keyed + self.rot_offset[i]
-            else:
-                bone.rotation_axis_angle[i] = self.rot_offset[i]
+            bone.rotation_axis_angle[i] = (keyed + self.rot_offset[i]) if keyed is not None else self.rot_offset[i]
     else:
         path = f'pose.bones["{name}"].rotation_euler'
         for i in range(3):
             keyed = get_keyed_value(action, obj, path, i, frame)
-            if keyed is not None:
-                bone.rotation_euler[i] = keyed + self.rot_offset[i]
-            else:
-                bone.rotation_euler[i] = self.rot_offset[i]
+            bone.rotation_euler[i] = (keyed + self.rot_offset[i]) if keyed is not None else self.rot_offset[i]
 
 
 def _update_scale(self, context):
-    if self.suppress_update:
+    if self.suppress_update or _is_transform_running():
         return
     bone = context.active_pose_bone
     if not bone:
         return
     obj = context.active_object
+    if not obj or not obj.animation_data or not obj.animation_data.action:
+        return
     action = obj.animation_data.action
     frame = context.scene.frame_current
     name = bone.name
 
     for i in range(3):
         keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].scale', i, frame)
-        if keyed is not None:
-            bone.scale[i] = keyed + self.scale_offset[i]
-        else:
-            bone.scale[i] = self.scale_offset[i]
+        bone.scale[i] = (keyed + self.scale_offset[i]) if keyed is not None else self.scale_offset[i]
 
 
 class LIVEOFFSET_PG_settings(PropertyGroup):
@@ -220,7 +217,12 @@ class LIVEOFFSET_PG_settings(PropertyGroup):
 
 
 def sync_offsets_from_bone(context):
-    """Push current live offsets of the active bone into the PropertyGroup."""
+    """Write current bone → offset properties.
+    Must NEVER be called from draw() or while a transform is running.
+    """
+    if _is_transform_running():
+        return
+
     wm = context.window_manager
     settings = wm.live_offset_settings
     bone = context.active_pose_bone
@@ -235,12 +237,10 @@ def sync_offsets_from_bone(context):
 
     settings.suppress_update = True
 
-    # Location
     for i in range(3):
         keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].location', i, frame)
         settings.loc_offset[i] = (bone.location[i] - keyed) if keyed is not None else bone.location[i]
 
-    # Rotation
     if bone.rotation_mode == 'QUATERNION':
         q = bone.rotation_quaternion
         for i, v in enumerate((q.w, q.x, q.y, q.z)):
@@ -256,7 +256,6 @@ def sync_offsets_from_bone(context):
             settings.rot_offset[i] = (v - keyed) if keyed is not None else v
         settings.rot_offset[3] = 0.0
 
-    # Scale
     for i in range(3):
         keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].scale', i, frame)
         settings.scale_offset[i] = (bone.scale[i] - keyed) if keyed is not None else bone.scale[i]
@@ -265,17 +264,61 @@ def sync_offsets_from_bone(context):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Redraw handler – keeps the panel live while dragging manipulators
+# Safe refresh – only after transform ends or on selection/frame change
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _depsgraph_update(scene, depsgraph):
+def _tag_ui_redraw():
     for window in bpy.context.window_manager.windows:
-        screen = window.screen
-        if not screen:
-            continue
-        for area in screen.areas:
+        for area in window.screen.areas:
             if area.type == 'VIEW_3D':
-                area.tag_redraw()
+                for region in area.regions:
+                    if region.type == 'UI':
+                        region.tag_redraw()
+
+
+@persistent
+def _on_depsgraph_update(scene, depsgraph):
+    """Detect transform end + selection/frame changes. Never write from draw."""
+    global _was_transforming
+
+    transforming = _is_transform_running()
+
+    # Just finished a transform → one-shot sync
+    if _was_transforming and not transforming:
+        try:
+            sync_offsets_from_bone(bpy.context)
+            _tag_ui_redraw()
+        except Exception:
+            pass
+
+    _was_transforming = transforming
+
+    # Also refresh when the user is not transforming and something relevant changed
+    if transforming:
+        return
+
+    # Cheap filter: only act on pose-mode armatures
+    obj = bpy.context.active_object
+    if not obj or obj.type != 'ARMATURE' or obj.mode != 'POSE':
+        return
+
+    # Only sync when the active bone or frame actually changed
+    # (depsgraph fires very often, so we keep this minimal)
+    try:
+        # We re-sync only on frame change or bone change by comparing a simple fingerprint
+        wm = bpy.context.window_manager
+        settings = wm.live_offset_settings
+        bone = bpy.context.active_pose_bone
+        frame = scene.frame_current
+
+        fingerprint = (bone.name if bone else "", frame)
+        last = getattr(settings, "_last_fingerprint", None)
+        if fingerprint != last:
+            settings._last_fingerprint = fingerprint
+            sync_offsets_from_bone(bpy.context)
+            _tag_ui_redraw()
+    except Exception:
+        pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -283,14 +326,16 @@ def _depsgraph_update(scene, depsgraph):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LIVEOFFSET_OT_apply(Operator):
-    """Apply live transform offsets to all keyframes in the active action"""
     bl_idname = "liveoffset.apply"
     bl_label = "Apply Offset"
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
-        pending = collect_offsets(context)
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
 
+        pending = collect_offsets(context)
         if not pending:
             self.report({'INFO'}, "Nothing to do – all offsets are zero")
             return {'CANCELLED'}
@@ -298,12 +343,10 @@ class LIVEOFFSET_OT_apply(Operator):
         bpy.ops.ed.undo_push(message="Live Transform Offset")
         apply_offsets(pending)
         context.scene.frame_set(context.scene.frame_current)
+        sync_offsets_from_bone(context)
 
         bones = {p[4] for p in pending}
-        self.report(
-            {'INFO'},
-            f"Shifted {len(pending)} channel(s) across {len(bones)} bone(s)"
-        )
+        self.report({'INFO'}, f"Shifted {len(pending)} channel(s) across {len(bones)} bone(s)")
         return {'FINISHED'}
 
     @classmethod
@@ -316,11 +359,24 @@ class LIVEOFFSET_OT_apply(Operator):
             and obj.animation_data
             and obj.animation_data.action
             and context.selected_pose_bones
+            and not _is_transform_running()
         )
 
 
+class LIVEOFFSET_OT_refresh(Operator):
+    """Manual refresh of the displayed offsets"""
+    bl_idname = "liveoffset.refresh"
+    bl_label = "Refresh Offsets"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        if not _is_transform_running():
+            sync_offsets_from_bone(context)
+        return {'FINISHED'}
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# UI Panel
+# UI Panel – NEVER writes to the offset properties
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LIVEOFFSET_PT_panel(Panel):
@@ -350,46 +406,43 @@ class LIVEOFFSET_PT_panel(Panel):
             layout.label(text="Select one or more bones", icon='INFO')
             return
 
-        # Keep the editable properties in sync with the current live pose.
-        # Guarded so a lookup error (e.g. Blender API changes) shows a
-        # message instead of leaving the whole panel silently blank.
-        try:
-            sync_offsets_from_bone(context)
-            pending = collect_offsets(context)
-        except Exception as exc:
-            layout.label(text=f"Live Offset error: {exc}", icon='ERROR')
-            return
-
+        transforming = _is_transform_running()
         settings = wm.live_offset_settings
 
-        # Header
+        # ── IMPORTANT: do NOT call sync_offsets_from_bone here ──
+        # Reading is fine, writing RNA properties is not.
+
+        pending = collect_offsets(context)
+
         box = layout.box()
         box.label(text=f"Selected: {len(selected)} bone(s)", icon='BONE_DATA')
         box.label(text=f"Frame: {context.scene.frame_current}", icon='TIME')
 
-        if not pending:
+        if transforming:
+            box.label(text="Transforming… (offsets frozen)", icon='TIME')
+        elif not pending:
             box.label(text="All offsets ≈ 0", icon='CHECKMARK')
         else:
             box.label(text=f"{len(pending)} channel(s) with offset", icon='MODIFIER')
 
-        # ── Active bone section ──────────────────────────────────────────────
         bone = context.active_pose_bone
         if bone:
             col = layout.column(align=True)
             col.label(text=f"Active: {bone.name}", icon='BONE_DATA')
 
-            # Rotation Mode dropdown (same as Blender's own UI)
             row = col.row()
             row.label(text="Rotation Mode")
             row.prop(bone, "rotation_mode", text="")
 
-            # Location Offset
+            # These prop() calls only *display* and accept user input.
+            # They never cause a write from draw() itself.
             box = layout.box()
             box.label(text="Location Offset")
+            box.enabled = not transforming
             box.prop(settings, "loc_offset", text="")
 
-            # Rotation Offset (adapts to current mode)
             box = layout.box()
+            box.enabled = not transforming
             if bone.rotation_mode == 'QUATERNION':
                 box.label(text="Rotation Offset (Quaternion)")
                 row = box.row(align=True)
@@ -411,12 +464,11 @@ class LIVEOFFSET_PT_panel(Panel):
                 box.prop(settings, "rot_offset", index=1, text="Y")
                 box.prop(settings, "rot_offset", index=2, text="Z")
 
-            # Scale Offset
             box = layout.box()
             box.label(text="Scale Offset")
+            box.enabled = not transforming
             box.prop(settings, "scale_offset", text="")
 
-        # ── Overview of all selected bones (when more than one) ──────────────
         if pending and len(selected) > 1:
             layout.separator()
             layout.label(text="All selected offsets:")
@@ -433,11 +485,12 @@ class LIVEOFFSET_PT_panel(Panel):
                     row.label(text=f"{short}[{idx}]")
                     row.label(text=f"{offset:+.5f}")
 
-        # Apply button
         layout.separator()
-        row = layout.row()
+        row = layout.row(align=True)
         row.scale_y = 1.5
+        row.enabled = not transforming
         row.operator("liveoffset.apply", text="Apply to Keyframes", icon='CHECKMARK')
+        row.operator("liveoffset.refresh", text="", icon='FILE_REFRESH')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -447,25 +500,41 @@ class LIVEOFFSET_PT_panel(Panel):
 classes = (
     LIVEOFFSET_PG_settings,
     LIVEOFFSET_OT_apply,
+    LIVEOFFSET_OT_refresh,
     LIVEOFFSET_PT_panel,
 )
 
 
 def register():
     for cls in classes:
-        bpy.utils.register_class(cls)
+        try:
+            bpy.utils.register_class(cls)
+        except ValueError:
+            bpy.utils.unregister_class(cls)
+            bpy.utils.register_class(cls)
 
-    bpy.types.WindowManager.live_offset_settings = bpy.props.PointerProperty(type=LIVEOFFSET_PG_settings)
+    if not hasattr(bpy.types.WindowManager, "live_offset_settings"):
+        bpy.types.WindowManager.live_offset_settings = bpy.props.PointerProperty(
+            type=LIVEOFFSET_PG_settings
+        )
 
-    if _depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(_depsgraph_update)
+    if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
 
 
 def unregister():
-    if _depsgraph_update in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(_depsgraph_update)
+    if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
+        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
 
-    del bpy.types.WindowManager.live_offset_settings
+    if hasattr(bpy.types.WindowManager, "live_offset_settings"):
+        del bpy.types.WindowManager.live_offset_settings
 
     for cls in reversed(classes):
-        bpy.utils.unregister_class(cls)
+        try:
+            bpy.utils.unregister_class(cls)
+        except RuntimeError:
+            pass
+
+
+if __name__ == "__main__":
+    register()
