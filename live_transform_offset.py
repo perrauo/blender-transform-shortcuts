@@ -2,6 +2,7 @@ import bpy
 from bpy.types import Panel, Operator, PropertyGroup
 from bpy.props import FloatVectorProperty, BoolProperty
 from bpy.app.handlers import persistent
+import json
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -21,7 +22,7 @@ _was_transforming = False
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Core logic
+# Core logic (shared / Live Offset)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _iter_channels(bone):
@@ -122,7 +123,7 @@ def get_keyed_value(action, obj, data_path, array_index, frame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PropertyGroup – update callbacks only run on real user edits
+# Live Offset PropertyGroup – update callbacks only run on real user edits
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _update_loc(self, context):
@@ -264,6 +265,100 @@ def sync_offsets_from_bone(context):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Transform Shortcuts PropertyGroup – actual transform values
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _update_ts_loc(self, context):
+    if self.suppress_update or _is_transform_running():
+        return
+    bone = context.active_pose_bone
+    if not bone:
+        return
+    bone.location = self.location[:]
+
+
+def _update_ts_rot(self, context):
+    if self.suppress_update or _is_transform_running():
+        return
+    bone = context.active_pose_bone
+    if not bone:
+        return
+
+    if bone.rotation_mode == 'QUATERNION':
+        bone.rotation_quaternion = self.rotation[:]
+    elif bone.rotation_mode == 'AXIS_ANGLE':
+        bone.rotation_axis_angle = self.rotation[:]
+    else:
+        bone.rotation_euler = self.rotation[:3]
+
+
+def _update_ts_scale(self, context):
+    if self.suppress_update or _is_transform_running():
+        return
+    bone = context.active_pose_bone
+    if not bone:
+        return
+    bone.scale = self.scale[:]
+
+
+class TRANSFORMSHORTCUTS_PG_settings(PropertyGroup):
+    suppress_update: BoolProperty(default=False)
+
+    location: FloatVectorProperty(
+        name="Location",
+        size=3,
+        subtype='TRANSLATION',
+        precision=5,
+        update=_update_ts_loc,
+    )
+    rotation: FloatVectorProperty(
+        name="Rotation",
+        size=4,
+        precision=5,
+        update=_update_ts_rot,
+    )
+    scale: FloatVectorProperty(
+        name="Scale",
+        size=3,
+        subtype='XYZ',
+        default=(1.0, 1.0, 1.0),
+        precision=5,
+        update=_update_ts_scale,
+    )
+
+
+def sync_transforms_from_bone(context):
+    """Write current bone transform → properties.
+    Must NEVER be called from draw() or while a transform is running.
+    """
+    if _is_transform_running():
+        return
+
+    wm = context.window_manager
+    settings = wm.transform_shortcuts_settings
+    bone = context.active_pose_bone
+
+    if not bone:
+        return
+
+    settings.suppress_update = True
+
+    settings.location = bone.location[:]
+
+    if bone.rotation_mode == 'QUATERNION':
+        q = bone.rotation_quaternion
+        settings.rotation = (q.w, q.x, q.y, q.z)
+    elif bone.rotation_mode == 'AXIS_ANGLE':
+        settings.rotation = bone.rotation_axis_angle[:]
+    else:
+        settings.rotation = (*bone.rotation_euler[:], 0.0)
+
+    settings.scale = bone.scale[:]
+
+    settings.suppress_update = False
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Safe refresh – only after transform ends or on selection/frame change
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -287,6 +382,7 @@ def _on_depsgraph_update(scene, depsgraph):
     if _was_transforming and not transforming:
         try:
             sync_offsets_from_bone(bpy.context)
+            sync_transforms_from_bone(bpy.context)
             _tag_ui_redraw()
         except Exception:
             pass
@@ -302,27 +398,24 @@ def _on_depsgraph_update(scene, depsgraph):
     if not obj or obj.type != 'ARMATURE' or obj.mode != 'POSE':
         return
 
-    # Only sync when the active bone or frame actually changed
-    # (depsgraph fires very often, so we keep this minimal)
     try:
-        # We re-sync only on frame change or bone change by comparing a simple fingerprint
         wm = bpy.context.window_manager
-        settings = wm.live_offset_settings
         bone = bpy.context.active_pose_bone
         frame = scene.frame_current
 
         fingerprint = (bone.name if bone else "", frame)
-        last = getattr(settings, "_last_fingerprint", None)
+        last = getattr(wm, "_ts_last_fingerprint", None)
         if fingerprint != last:
-            settings._last_fingerprint = fingerprint
+            wm._ts_last_fingerprint = fingerprint
             sync_offsets_from_bone(bpy.context)
+            sync_transforms_from_bone(bpy.context)
             _tag_ui_redraw()
     except Exception:
         pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Operator
+# Live Offset Operators
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LIVEOFFSET_OT_apply(Operator):
@@ -375,8 +468,230 @@ class LIVEOFFSET_OT_refresh(Operator):
         return {'FINISHED'}
 
 
+class LIVEOFFSET_OT_copy(Operator):
+    """Copy current location / rotation / scale offsets to the system clipboard"""
+    bl_idname = "liveoffset.copy"
+    bl_label = "Copy Offsets"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.window_manager.live_offset_settings
+
+        data = {
+            "live_offset": True,
+            "loc":   list(settings.loc_offset),
+            "rot":   list(settings.rot_offset),
+            "scale": list(settings.scale_offset),
+        }
+
+        try:
+            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
+            self.report({'INFO'}, "Offsets copied to clipboard")
+        except Exception as e:
+            self.report({'ERROR'}, f"Copy failed: {e}")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj
+            and obj.type == 'ARMATURE'
+            and obj.mode == 'POSE'
+            and not _is_transform_running()
+        )
+
+
+class LIVEOFFSET_OT_paste(Operator):
+    """Paste location / rotation / scale offsets from the system clipboard"""
+    bl_idname = "liveoffset.paste"
+    bl_label = "Paste Offsets"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        clipboard = context.window_manager.clipboard.strip()
+        if not clipboard:
+            self.report({'WARNING'}, "Clipboard is empty")
+            return {'CANCELLED'}
+
+        try:
+            data = json.loads(clipboard)
+        except json.JSONDecodeError:
+            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
+            return {'CANCELLED'}
+
+        if not isinstance(data, dict) or not data.get("live_offset"):
+            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
+            return {'CANCELLED'}
+
+        settings = context.window_manager.live_offset_settings
+
+        settings.suppress_update = True
+
+        try:
+            if "loc" in data and len(data["loc"]) == 3:
+                settings.loc_offset = data["loc"]
+            if "rot" in data and len(data["rot"]) == 4:
+                settings.rot_offset = data["rot"]
+            if "scale" in data and len(data["scale"]) == 3:
+                settings.scale_offset = data["scale"]
+        except Exception as e:
+            settings.suppress_update = False
+            self.report({'ERROR'}, f"Paste failed: {e}")
+            return {'CANCELLED'}
+
+        settings.suppress_update = False
+
+        _update_loc(settings, context)
+        _update_rot(settings, context)
+        _update_scale(settings, context)
+
+        self.report({'INFO'}, "Offsets pasted from clipboard")
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj
+            and obj.type == 'ARMATURE'
+            and obj.mode == 'POSE'
+            and context.active_pose_bone
+            and not _is_transform_running()
+        )
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# UI Panel – NEVER writes to the offset properties
+# Transform Shortcuts Operators (Copy / Paste actual transforms)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TRANSFORMSHORTCUTS_OT_copy(Operator):
+    """Copy current location / rotation / scale to the system clipboard"""
+    bl_idname = "transformshortcuts.copy"
+    bl_label = "Copy Transform"
+    bl_options = {'REGISTER'}
+
+    def execute(self, context):
+        settings = context.window_manager.transform_shortcuts_settings
+        bone = context.active_pose_bone
+
+        data = {
+            "transform_shortcuts": True,   # marker so paste can verify
+            "location": list(settings.location),
+            "rotation": list(settings.rotation),
+            "scale":    list(settings.scale),
+            "rotation_mode": bone.rotation_mode if bone else "XYZ",
+        }
+
+        try:
+            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
+            self.report({'INFO'}, "Transform copied to clipboard")
+        except Exception as e:
+            self.report({'ERROR'}, f"Copy failed: {e}")
+            return {'CANCELLED'}
+
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj
+            and obj.type == 'ARMATURE'
+            and obj.mode == 'POSE'
+            and context.active_pose_bone
+            and not _is_transform_running()
+        )
+
+
+class TRANSFORMSHORTCUTS_OT_paste(Operator):
+    """Paste location / rotation / scale from the system clipboard"""
+    bl_idname = "transformshortcuts.paste"
+    bl_label = "Paste Transform"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        clipboard = context.window_manager.clipboard.strip()
+        if not clipboard:
+            self.report({'WARNING'}, "Clipboard is empty")
+            return {'CANCELLED'}
+
+        try:
+            data = json.loads(clipboard)
+        except json.JSONDecodeError:
+            self.report({'WARNING'}, "Clipboard does not contain valid Transform data")
+            return {'CANCELLED'}
+
+        if not isinstance(data, dict) or not data.get("transform_shortcuts"):
+            self.report({'WARNING'}, "Clipboard does not contain valid Transform data")
+            return {'CANCELLED'}
+
+        settings = context.window_manager.transform_shortcuts_settings
+        bone = context.active_pose_bone
+        if not bone:
+            self.report({'WARNING'}, "No active pose bone")
+            return {'CANCELLED'}
+
+        settings.suppress_update = True
+
+        try:
+            if "location" in data and len(data["location"]) == 3:
+                settings.location = data["location"]
+            if "rotation" in data and len(data["rotation"]) == 4:
+                settings.rotation = data["rotation"]
+            if "scale" in data and len(data["scale"]) == 3:
+                settings.scale = data["scale"]
+        except Exception as e:
+            settings.suppress_update = False
+            self.report({'ERROR'}, f"Paste failed: {e}")
+            return {'CANCELLED'}
+
+        settings.suppress_update = False
+
+        # Apply to the bone
+        _update_ts_loc(settings, context)
+        _update_ts_rot(settings, context)
+        _update_ts_scale(settings, context)
+
+        self.report({'INFO'}, "Transform pasted from clipboard")
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj
+            and obj.type == 'ARMATURE'
+            and obj.mode == 'POSE'
+            and context.active_pose_bone
+            and not _is_transform_running()
+        )
+
+
+class TRANSFORMSHORTCUTS_OT_refresh(Operator):
+    """Manual refresh of the displayed transforms"""
+    bl_idname = "transformshortcuts.refresh"
+    bl_label = "Refresh Transform"
+    bl_options = {'INTERNAL'}
+
+    def execute(self, context):
+        if not _is_transform_running():
+            sync_transforms_from_bone(context)
+        return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# UI Panels
 # ─────────────────────────────────────────────────────────────────────────────
 
 class LIVEOFFSET_PT_panel(Panel):
@@ -384,7 +699,7 @@ class LIVEOFFSET_PT_panel(Panel):
     bl_idname = "LIVEOFFSET_PT_panel"
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Live Offset"
+    bl_category = "Transform Shortcuts"
 
     def draw(self, context):
         layout = self.layout
@@ -409,9 +724,6 @@ class LIVEOFFSET_PT_panel(Panel):
         transforming = _is_transform_running()
         settings = wm.live_offset_settings
 
-        # ── IMPORTANT: do NOT call sync_offsets_from_bone here ──
-        # Reading is fine, writing RNA properties is not.
-
         pending = collect_offsets(context)
 
         box = layout.box()
@@ -434,8 +746,6 @@ class LIVEOFFSET_PT_panel(Panel):
             row.label(text="Rotation Mode")
             row.prop(bone, "rotation_mode", text="")
 
-            # These prop() calls only *display* and accept user input.
-            # They never cause a write from draw() itself.
             box = layout.box()
             box.label(text="Location Offset")
             box.enabled = not transforming
@@ -486,11 +796,108 @@ class LIVEOFFSET_PT_panel(Panel):
                     row.label(text=f"{offset:+.5f}")
 
         layout.separator()
+
+        row = layout.row(align=True)
+        row.enabled = not transforming
+        row.operator("liveoffset.copy", text="Copy Offsets", icon='COPYDOWN')
+        row.operator("liveoffset.paste", text="Paste Offsets", icon='PASTEDOWN')
+
         row = layout.row(align=True)
         row.scale_y = 1.5
         row.enabled = not transforming
         row.operator("liveoffset.apply", text="Apply to Keyframes", icon='CHECKMARK')
         row.operator("liveoffset.refresh", text="", icon='FILE_REFRESH')
+
+
+class TRANSFORMSHORTCUTS_PT_panel(Panel):
+    bl_label = "Transform Shortcuts"
+    bl_idname = "TRANSFORMSHORTCUTS_PT_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Transform Shortcuts"
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+        wm = context.window_manager
+
+        if not obj or obj.type != 'ARMATURE':
+            layout.label(text="Select an Armature", icon='ERROR')
+            return
+        if obj.mode != 'POSE':
+            layout.label(text="Switch to Pose Mode", icon='ERROR')
+            return
+
+        bone = context.active_pose_bone
+        if not bone:
+            layout.label(text="Select a bone", icon='INFO')
+            return
+
+        transforming = _is_transform_running()
+        settings = wm.transform_shortcuts_settings
+
+        # Header info
+        box = layout.box()
+        box.label(text=f"Active: {bone.name}", icon='BONE_DATA')
+        box.label(text=f"Frame: {context.scene.frame_current}", icon='TIME')
+
+        if transforming:
+            box.label(text="Transforming… (values frozen)", icon='TIME')
+
+        # Rotation mode
+        row = layout.row()
+        row.label(text="Rotation Mode")
+        row.prop(bone, "rotation_mode", text="")
+
+        # Location
+        box = layout.box()
+        box.label(text="Location")
+        box.enabled = not transforming
+        box.prop(settings, "location", text="")
+
+        # Rotation
+        box = layout.box()
+        box.enabled = not transforming
+        if bone.rotation_mode == 'QUATERNION':
+            box.label(text="Rotation (Quaternion)")
+            row = box.row(align=True)
+            row.prop(settings, "rotation", index=0, text="W")
+            row.prop(settings, "rotation", index=1, text="X")
+            row = box.row(align=True)
+            row.prop(settings, "rotation", index=2, text="Y")
+            row.prop(settings, "rotation", index=3, text="Z")
+        elif bone.rotation_mode == 'AXIS_ANGLE':
+            box.label(text="Rotation (Axis-Angle)")
+            box.prop(settings, "rotation", index=0, text="Angle")
+            row = box.row(align=True)
+            row.prop(settings, "rotation", index=1, text="X")
+            row.prop(settings, "rotation", index=2, text="Y")
+            row.prop(settings, "rotation", index=3, text="Z")
+        else:
+            box.label(text="Rotation (Euler)")
+            box.prop(settings, "rotation", index=0, text="X")
+            box.prop(settings, "rotation", index=1, text="Y")
+            box.prop(settings, "rotation", index=2, text="Z")
+
+        # Scale
+        box = layout.box()
+        box.label(text="Scale")
+        box.enabled = not transforming
+        box.prop(settings, "scale", text="")
+
+        layout.separator()
+
+        # Copy / Paste Transform
+        row = layout.row(align=True)
+        row.scale_y = 1.4
+        row.enabled = not transforming
+        row.operator("transformshortcuts.copy", text="Copy Transform", icon='COPYDOWN')
+        row.operator("transformshortcuts.paste", text="Paste Transform", icon='PASTEDOWN')
+
+        # Refresh
+        row = layout.row()
+        row.enabled = not transforming
+        row.operator("transformshortcuts.refresh", text="Refresh", icon='FILE_REFRESH')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -499,9 +906,16 @@ class LIVEOFFSET_PT_panel(Panel):
 
 classes = (
     LIVEOFFSET_PG_settings,
+    TRANSFORMSHORTCUTS_PG_settings,
     LIVEOFFSET_OT_apply,
     LIVEOFFSET_OT_refresh,
+    LIVEOFFSET_OT_copy,
+    LIVEOFFSET_OT_paste,
+    TRANSFORMSHORTCUTS_OT_copy,
+    TRANSFORMSHORTCUTS_OT_paste,
+    TRANSFORMSHORTCUTS_OT_refresh,
     LIVEOFFSET_PT_panel,
+    TRANSFORMSHORTCUTS_PT_panel,
 )
 
 
@@ -518,6 +932,11 @@ def register():
             type=LIVEOFFSET_PG_settings
         )
 
+    if not hasattr(bpy.types.WindowManager, "transform_shortcuts_settings"):
+        bpy.types.WindowManager.transform_shortcuts_settings = bpy.props.PointerProperty(
+            type=TRANSFORMSHORTCUTS_PG_settings
+        )
+
     if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
 
@@ -528,6 +947,9 @@ def unregister():
 
     if hasattr(bpy.types.WindowManager, "live_offset_settings"):
         del bpy.types.WindowManager.live_offset_settings
+
+    if hasattr(bpy.types.WindowManager, "transform_shortcuts_settings"):
+        del bpy.types.WindowManager.transform_shortcuts_settings
 
     for cls in reversed(classes):
         try:
