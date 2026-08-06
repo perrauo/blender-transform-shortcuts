@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Live Transform Offset Propagator",
-    "author": "Your Name",
-    "version": (2, 1, 0),
-    "blender": (4, 5, 0),
-    "location": "View3D > Sidebar > Live Offset",
-    "description": "Display live transform offsets and apply them to all keyframes",
+    "name": "Animation Shortcuts",
+    "author": "",
+    "version": (1, 0, 0),
+    "blender": (3, 0, 0),
+    "location": "View3D > Sidebar > Transform Shortcuts",
+    "description": "Live Offset tools and quick Transform copy/paste shortcuts for pose bones",
     "category": "Animation",
 }
 

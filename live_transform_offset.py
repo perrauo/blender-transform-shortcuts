@@ -3,6 +3,7 @@ from bpy.types import Panel, Operator, PropertyGroup
 from bpy.props import FloatVectorProperty, BoolProperty
 from bpy.app.handlers import persistent
 import json
+import math
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -17,7 +18,6 @@ def _is_transform_running():
     return False
 
 
-# Track transition so we can refresh once after a transform ends
 _was_transforming = False
 
 
@@ -123,7 +123,7 @@ def get_keyed_value(action, obj, data_path, array_index, frame):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Live Offset PropertyGroup – update callbacks only run on real user edits
+# Live Offset PropertyGroup
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _update_loc(self, context):
@@ -218,9 +218,6 @@ class LIVEOFFSET_PG_settings(PropertyGroup):
 
 
 def sync_offsets_from_bone(context):
-    """Write current bone → offset properties.
-    Must NEVER be called from draw() or while a transform is running.
-    """
     if _is_transform_running():
         return
 
@@ -328,9 +325,6 @@ class TRANSFORMSHORTCUTS_PG_settings(PropertyGroup):
 
 
 def sync_transforms_from_bone(context):
-    """Write current bone transform → properties.
-    Must NEVER be called from draw() or while a transform is running.
-    """
     if _is_transform_running():
         return
 
@@ -359,7 +353,7 @@ def sync_transforms_from_bone(context):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Safe refresh – only after transform ends or on selection/frame change
+# Safe refresh
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _tag_ui_redraw():
@@ -373,12 +367,10 @@ def _tag_ui_redraw():
 
 @persistent
 def _on_depsgraph_update(scene, depsgraph):
-    """Detect transform end + selection/frame changes. Never write from draw."""
     global _was_transforming
 
     transforming = _is_transform_running()
 
-    # Just finished a transform → one-shot sync
     if _was_transforming and not transforming:
         try:
             sync_offsets_from_bone(bpy.context)
@@ -389,11 +381,9 @@ def _on_depsgraph_update(scene, depsgraph):
 
     _was_transforming = transforming
 
-    # Also refresh when the user is not transforming and something relevant changed
     if transforming:
         return
 
-    # Cheap filter: only act on pose-mode armatures
     obj = bpy.context.active_object
     if not obj or obj.type != 'ARMATURE' or obj.mode != 'POSE':
         return
@@ -457,7 +447,6 @@ class LIVEOFFSET_OT_apply(Operator):
 
 
 class LIVEOFFSET_OT_refresh(Operator):
-    """Manual refresh of the displayed offsets"""
     bl_idname = "liveoffset.refresh"
     bl_label = "Refresh Offsets"
     bl_options = {'INTERNAL'}
@@ -468,8 +457,45 @@ class LIVEOFFSET_OT_refresh(Operator):
         return {'FINISHED'}
 
 
+class LIVEOFFSET_OT_reset(Operator):
+    """Reset all offsets to zero (restores bone to keyed values)"""
+    bl_idname = "liveoffset.reset"
+    bl_label = "Reset Offsets"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        settings = context.window_manager.live_offset_settings
+
+        settings.suppress_update = True
+        settings.loc_offset = (0.0, 0.0, 0.0)
+        settings.rot_offset = (0.0, 0.0, 0.0, 0.0)
+        settings.scale_offset = (0.0, 0.0, 0.0)
+        settings.suppress_update = False
+
+        _update_loc(settings, context)
+        _update_rot(settings, context)
+        _update_scale(settings, context)
+
+        self.report({'INFO'}, "Offsets reset to zero")
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj
+            and obj.type == 'ARMATURE'
+            and obj.mode == 'POSE'
+            and context.active_pose_bone
+            and not _is_transform_running()
+        )
+
+
 class LIVEOFFSET_OT_copy(Operator):
-    """Copy current location / rotation / scale offsets to the system clipboard"""
     bl_idname = "liveoffset.copy"
     bl_label = "Copy Offsets"
     bl_options = {'REGISTER'}
@@ -505,7 +531,6 @@ class LIVEOFFSET_OT_copy(Operator):
 
 
 class LIVEOFFSET_OT_paste(Operator):
-    """Paste location / rotation / scale offsets from the system clipboard"""
     bl_idname = "liveoffset.paste"
     bl_label = "Paste Offsets"
     bl_options = {'REGISTER', 'UNDO'}
@@ -568,11 +593,10 @@ class LIVEOFFSET_OT_paste(Operator):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Transform Shortcuts Operators (Copy / Paste actual transforms)
+# Transform Shortcuts Operators
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TRANSFORMSHORTCUTS_OT_copy(Operator):
-    """Copy current location / rotation / scale to the system clipboard"""
     bl_idname = "transformshortcuts.copy"
     bl_label = "Copy Transform"
     bl_options = {'REGISTER'}
@@ -582,7 +606,7 @@ class TRANSFORMSHORTCUTS_OT_copy(Operator):
         bone = context.active_pose_bone
 
         data = {
-            "transform_shortcuts": True,   # marker so paste can verify
+            "transform_shortcuts": True,
             "location": list(settings.location),
             "rotation": list(settings.rotation),
             "scale":    list(settings.scale),
@@ -611,7 +635,6 @@ class TRANSFORMSHORTCUTS_OT_copy(Operator):
 
 
 class TRANSFORMSHORTCUTS_OT_paste(Operator):
-    """Paste location / rotation / scale from the system clipboard"""
     bl_idname = "transformshortcuts.paste"
     bl_label = "Paste Transform"
     bl_options = {'REGISTER', 'UNDO'}
@@ -658,7 +681,6 @@ class TRANSFORMSHORTCUTS_OT_paste(Operator):
 
         settings.suppress_update = False
 
-        # Apply to the bone
         _update_ts_loc(settings, context)
         _update_ts_rot(settings, context)
         _update_ts_scale(settings, context)
@@ -679,7 +701,6 @@ class TRANSFORMSHORTCUTS_OT_paste(Operator):
 
 
 class TRANSFORMSHORTCUTS_OT_refresh(Operator):
-    """Manual refresh of the displayed transforms"""
     bl_idname = "transformshortcuts.refresh"
     bl_label = "Refresh Transform"
     bl_options = {'INTERNAL'}
@@ -688,6 +709,254 @@ class TRANSFORMSHORTCUTS_OT_refresh(Operator):
         if not _is_transform_running():
             sync_transforms_from_bone(context)
         return {'FINISHED'}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anim Shortcuts – Loop Detection
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Tolerance for considering two channel values identical
+_LOOP_TOL = 1e-5
+# Minimum acceptable loop length (frames)
+_MIN_LOOP_FRAMES = 2
+
+
+def _collect_pose_fcurves(action, obj):
+    """Return list of (fcurve, data_path, array_index) for every pose-bone channel."""
+    fcurves = _get_action_fcurves(action, obj)
+    if fcurves is None:
+        return []
+
+    result = []
+    for fc in fcurves:
+        if fc.data_path.startswith('pose.bones[') and not fc.lock and not fc.mute:
+            result.append((fc, fc.data_path, fc.array_index))
+    return result
+
+
+def _get_action_frame_range(fcurves):
+    """Return (min_frame, max_frame) from all keyframe points, or None."""
+    min_f = float('inf')
+    max_f = float('-inf')
+    has_keys = False
+
+    for fc, _, _ in fcurves:
+        for kp in fc.keyframe_points:
+            t = kp.co[0]
+            if t < min_f:
+                min_f = t
+            if t > max_f:
+                max_f = t
+            has_keys = True
+
+    if not has_keys:
+        return None
+    return (math.floor(min_f), math.ceil(max_f))
+
+
+def _pose_matches(fcurves, frame_a, frame_b, tol=_LOOP_TOL):
+    """Return True if every channel evaluates identically at frame_a and frame_b."""
+    for fc, _, _ in fcurves:
+        va = fc.evaluate(frame_a)
+        vb = fc.evaluate(frame_b)
+        if abs(va - vb) > tol:
+            return False
+    return True
+
+
+def _is_valid_period(fcurves, start, period, end, tol=_LOOP_TOL):
+    """
+    Verify that the animation is periodic with the given period over [start, end].
+    Checks every integer frame in the first cycle against the shifted frame.
+    Also requires that start pose matches start+period.
+    """
+    if period < _MIN_LOOP_FRAMES:
+        return False
+    if start + period > end:
+        return False
+
+    # Primary check: start pose must match the pose at start+period
+    if not _pose_matches(fcurves, start, start + period, tol):
+        return False
+
+    # Full verification: every frame in the first cycle must match its counterpart
+    # We sample every integer frame for maximum accuracy
+    for f in range(int(start), int(start + period)):
+        if f + period > end:
+            break
+        if not _pose_matches(fcurves, f, f + period, tol):
+            return False
+
+    return True
+
+
+def detect_loop_period(context, tol=_LOOP_TOL):
+    """
+    Detect the shortest valid loop period for the active armature's action.
+    Requires EVERY bone channel to match.
+    Returns (start_frame, period) or (None, None) on failure.
+    """
+    obj = context.active_object
+    if not obj or obj.type != 'ARMATURE' or not obj.animation_data or not obj.animation_data.action:
+        return None, None
+
+    action = obj.animation_data.action
+    fcurves = _collect_pose_fcurves(action, obj)
+    if not fcurves:
+        return None, None
+
+    frame_range = _get_action_frame_range(fcurves)
+    if frame_range is None:
+        return None, None
+
+    start, end = frame_range
+    total_len = end - start
+    if total_len < _MIN_LOOP_FRAMES * 2:
+        return None, None
+
+    # Strategy:
+    # 1. Compute the reference pose at 'start'
+    # 2. Scan forward for frames where the pose matches the reference
+    # 3. For each candidate period, fully verify the cycle
+    # Prefer the shortest valid period that covers a reasonable amount of the action
+
+    candidates = []
+
+    # Scan every integer frame for a pose match with the start
+    # (we start looking from start + MIN so we don't accept period 0)
+    max_search = start + total_len // 2 + 1
+    for candidate_end in range(int(start) + _MIN_LOOP_FRAMES, int(max_search) + 1):
+        if _pose_matches(fcurves, start, candidate_end, tol):
+            period = candidate_end - start
+            if _is_valid_period(fcurves, start, period, end, tol):
+                candidates.append(period)
+
+    if not candidates:
+        # Fallback: try a coarser scan in case of floating-point drift on non-integer keys
+        # or if the true start is not exactly at the first key
+        for candidate_end in range(int(start) + _MIN_LOOP_FRAMES, int(max_search) + 1, 1):
+            if _pose_matches(fcurves, start, candidate_end, tol * 10):  # slightly looser
+                period = candidate_end - start
+                if _is_valid_period(fcurves, start, period, end, tol * 10):
+                    candidates.append(period)
+                    break
+
+    if not candidates:
+        return None, None
+
+    # Return the shortest valid period
+    best_period = min(candidates)
+    return start, best_period
+
+
+def truncate_after_loop(action, obj, start, period):
+    """Delete every keyframe that lies strictly after start + period."""
+    fcurves = _get_action_fcurves(action, obj)
+    if fcurves is None:
+        return 0
+
+    cutoff = start + period
+    removed = 0
+
+    for fc in fcurves:
+        # Walk backwards so removals don't invalidate indices
+        for i in range(len(fc.keyframe_points) - 1, -1, -1):
+            kp = fc.keyframe_points[i]
+            if kp.co[0] > cutoff + 1e-6:  # strict after
+                fc.keyframe_points.remove(kp)
+                removed += 1
+        fc.update()
+
+    return removed
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Anim Shortcuts Operators
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ANIMSHORTCUTS_OT_detect_loop(Operator):
+    """Detect the shortest looping period that holds for every bone and set the scene frame range to it"""
+    bl_idname = "animshortcuts.detect_loop"
+    bl_label = "Detect Loop"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        start, period = detect_loop_period(context)
+        if start is None or period is None:
+            self.report({'WARNING'}, "No valid loop detected (all bones must match)")
+            return {'CANCELLED'}
+
+        scene = context.scene
+        scene.frame_start = int(start)
+        scene.frame_end = int(start + period)
+        # Also set preview range so the timeline window focuses on the loop
+        scene.frame_preview_start = int(start)
+        scene.frame_preview_end = int(start + period)
+        scene.use_preview_range = True
+
+        self.report({'INFO'}, f"Loop detected: frames {int(start)} → {int(start + period)} (period = {period})")
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj
+            and obj.type == 'ARMATURE'
+            and obj.mode == 'POSE'
+            and obj.animation_data
+            and obj.animation_data.action
+            and not _is_transform_running()
+        )
+
+
+class ANIMSHORTCUTS_OT_detect_truncate_loop(Operator):
+    """Detect the loop and delete every keyframe that lies after the end of the first cycle"""
+    bl_idname = "animshortcuts.detect_truncate_loop"
+    bl_label = "Detect and Truncate Loop"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        start, period = detect_loop_period(context)
+        if start is None or period is None:
+            self.report({'WARNING'}, "No valid loop detected (all bones must match)")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        action = obj.animation_data.action
+
+        bpy.ops.ed.undo_push(message="Detect and Truncate Loop")
+
+        removed = truncate_after_loop(action, obj, start, period)
+
+        scene = context.scene
+        scene.frame_start = int(start)
+        scene.frame_end = int(start + period)
+        scene.frame_preview_start = int(start)
+        scene.frame_preview_end = int(start + period)
+        scene.use_preview_range = True
+
+        # Force a refresh of the animation data
+        context.scene.frame_set(context.scene.frame_current)
+
+        self.report(
+            {'INFO'},
+            f"Loop truncated to frames {int(start)} → {int(start + period)} "
+            f"(period = {period}, removed {removed} keyframe(s))"
+        )
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj
+            and obj.type == 'ARMATURE'
+            and obj.mode == 'POSE'
+            and obj.animation_data
+            and obj.animation_data.action
+            and not _is_transform_running()
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -723,12 +992,11 @@ class LIVEOFFSET_PT_panel(Panel):
 
         transforming = _is_transform_running()
         settings = wm.live_offset_settings
-
         pending = collect_offsets(context)
 
+        # Status only (no active bone / frame display)
         box = layout.box()
         box.label(text=f"Selected: {len(selected)} bone(s)", icon='BONE_DATA')
-        box.label(text=f"Frame: {context.scene.frame_current}", icon='TIME')
 
         if transforming:
             box.label(text="Transforming… (offsets frozen)", icon='TIME')
@@ -739,18 +1007,18 @@ class LIVEOFFSET_PT_panel(Panel):
 
         bone = context.active_pose_bone
         if bone:
-            col = layout.column(align=True)
-            col.label(text=f"Active: {bone.name}", icon='BONE_DATA')
-
-            row = col.row()
+            # Rotation mode only
+            row = layout.row()
             row.label(text="Rotation Mode")
             row.prop(bone, "rotation_mode", text="")
 
+            # Location Offset
             box = layout.box()
             box.label(text="Location Offset")
             box.enabled = not transforming
             box.prop(settings, "loc_offset", text="")
 
+            # Rotation Offset
             box = layout.box()
             box.enabled = not transforming
             if bone.rotation_mode == 'QUATERNION':
@@ -774,6 +1042,7 @@ class LIVEOFFSET_PT_panel(Panel):
                 box.prop(settings, "rot_offset", index=1, text="Y")
                 box.prop(settings, "rot_offset", index=2, text="Z")
 
+            # Scale Offset
             box = layout.box()
             box.label(text="Scale Offset")
             box.enabled = not transforming
@@ -797,15 +1066,18 @@ class LIVEOFFSET_PT_panel(Panel):
 
         layout.separator()
 
+        # Copy / Paste
         row = layout.row(align=True)
         row.enabled = not transforming
         row.operator("liveoffset.copy", text="Copy Offsets", icon='COPYDOWN')
         row.operator("liveoffset.paste", text="Paste Offsets", icon='PASTEDOWN')
 
+        # Apply / Reset / Refresh
         row = layout.row(align=True)
-        row.scale_y = 1.5
+        row.scale_y = 1.4
         row.enabled = not transforming
         row.operator("liveoffset.apply", text="Apply to Keyframes", icon='CHECKMARK')
+        row.operator("liveoffset.reset", text="Reset", icon='LOOP_BACK')
         row.operator("liveoffset.refresh", text="", icon='FILE_REFRESH')
 
 
@@ -836,7 +1108,6 @@ class TRANSFORMSHORTCUTS_PT_panel(Panel):
         transforming = _is_transform_running()
         settings = wm.transform_shortcuts_settings
 
-        # Header info
         box = layout.box()
         box.label(text=f"Active: {bone.name}", icon='BONE_DATA')
         box.label(text=f"Frame: {context.scene.frame_current}", icon='TIME')
@@ -844,7 +1115,6 @@ class TRANSFORMSHORTCUTS_PT_panel(Panel):
         if transforming:
             box.label(text="Transforming… (values frozen)", icon='TIME')
 
-        # Rotation mode
         row = layout.row()
         row.label(text="Rotation Mode")
         row.prop(bone, "rotation_mode", text="")
@@ -887,17 +1157,52 @@ class TRANSFORMSHORTCUTS_PT_panel(Panel):
 
         layout.separator()
 
-        # Copy / Paste Transform
         row = layout.row(align=True)
         row.scale_y = 1.4
         row.enabled = not transforming
         row.operator("transformshortcuts.copy", text="Copy Transform", icon='COPYDOWN')
         row.operator("transformshortcuts.paste", text="Paste Transform", icon='PASTEDOWN')
 
-        # Refresh
         row = layout.row()
         row.enabled = not transforming
         row.operator("transformshortcuts.refresh", text="Refresh", icon='FILE_REFRESH')
+
+
+class ANIMSHORTCUTS_PT_panel(Panel):
+    bl_label = "Anim Shortcuts"
+    bl_idname = "ANIMSHORTCUTS_PT_panel"
+    bl_space_type = 'VIEW_3D'
+    bl_region_type = 'UI'
+    bl_category = "Anim Shortcuts"
+
+    def draw(self, context):
+        layout = self.layout
+        obj = context.active_object
+
+        if not obj or obj.type != 'ARMATURE':
+            layout.label(text="Select an Armature", icon='ERROR')
+            return
+        if obj.mode != 'POSE':
+            layout.label(text="Switch to Pose Mode", icon='ERROR')
+            return
+        if not obj.animation_data or not obj.animation_data.action:
+            layout.label(text="No active Action", icon='ERROR')
+            return
+
+        box = layout.box()
+        box.label(text="Loop Detection", icon='LOOP_FORWARDS')
+        box.label(text="Requires every bone channel to match")
+
+        layout.separator()
+
+        col = layout.column(align=True)
+        col.scale_y = 1.4
+        col.operator("animshortcuts.detect_loop", text="Detect Loop", icon='TIME')
+        col.operator("animshortcuts.detect_truncate_loop", text="Detect and Truncate Loop", icon='TRASH')
+
+        layout.separator()
+        layout.label(text="Detect Loop → sets scene & preview range", icon='INFO')
+        layout.label(text="Truncate → also deletes keys after the loop", icon='INFO')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -909,13 +1214,17 @@ classes = (
     TRANSFORMSHORTCUTS_PG_settings,
     LIVEOFFSET_OT_apply,
     LIVEOFFSET_OT_refresh,
+    LIVEOFFSET_OT_reset,
     LIVEOFFSET_OT_copy,
     LIVEOFFSET_OT_paste,
     TRANSFORMSHORTCUTS_OT_copy,
     TRANSFORMSHORTCUTS_OT_paste,
     TRANSFORMSHORTCUTS_OT_refresh,
+    ANIMSHORTCUTS_OT_detect_loop,
+    ANIMSHORTCUTS_OT_detect_truncate_loop,
     LIVEOFFSET_PT_panel,
     TRANSFORMSHORTCUTS_PT_panel,
+    ANIMSHORTCUTS_PT_panel,
 )
 
 
