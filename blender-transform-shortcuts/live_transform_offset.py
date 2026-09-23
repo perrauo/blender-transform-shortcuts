@@ -151,13 +151,30 @@ def _ensure_fcurve(action, obj, data_path, array_index):
 
 
 def _copy_fcurve_keyframes(src_fc, tgt_fc):
-    """Replace all keyframes on tgt_fc with a full copy of those on src_fc."""
-    # Clear existing keys (backwards compatible)
-    while len(tgt_fc.keyframe_points):
-        tgt_fc.keyframe_points.remove(tgt_fc.keyframe_points[0])
+    """Copy keyframes from src_fc into tgt_fc, preserving any target keys
+    that lie outside the source curve's frame range.
 
+    Keys whose frame falls inside [src_min, src_max] are removed and
+    replaced by the corresponding source keys. Keys completely outside
+    that range are left untouched.
+    """
+    if not src_fc.keyframe_points:
+        return
+
+    # Determine the frame span of the source curve
+    src_frames = [kp.co.x for kp in src_fc.keyframe_points]
+    src_min = min(src_frames)
+    src_max = max(src_frames)
+
+    # Remove target keys that fall inside the source range (inclusive)
+    # Walk backwards so indices stay valid while removing
+    for i in range(len(tgt_fc.keyframe_points) - 1, -1, -1):
+        t = tgt_fc.keyframe_points[i].co.x
+        if src_min - 1e-6 <= t <= src_max + 1e-6:
+            tgt_fc.keyframe_points.remove(tgt_fc.keyframe_points[i])
+
+    # Insert a full copy of every source keyframe
     for src_kp in src_fc.keyframe_points:
-        # Insert returns the new keyframe point
         new_kp = tgt_fc.keyframe_points.insert(
             src_kp.co.x, src_kp.co.y, options={'FAST'}
         )
@@ -681,6 +698,12 @@ class ANIMSHORTCUTS_PG_settings(PropertyGroup):
     target_action: EnumProperty(
         name="Target Action",
         description="Action that will receive the keyframes of the currently selected bones",
+        items=_action_enum_items,
+    )
+
+    homogenize_target_action: EnumProperty(
+        name="Homogenize Target Action",
+        description="Target Action whose quaternion rotations will be aligned to the active (source) Action's dominant orientation",
         items=_action_enum_items,
     )
 
@@ -2094,6 +2117,125 @@ def get_action_total_length(context):
     return fr[1] - fr[0]
 
 
+def center_character_horizontal(action, obj, axes=(0, 1)):
+    """
+    For every unique keyframe in the Action, compute the average world-space
+    horizontal position of all pose bones and counter-shift the root bone(s)
+    so that the character's centre sits at the origin in X/Y.
+
+    Vertical (Z) motion is left completely free.
+    Returns (frames_processed, bones_adjusted, keys_touched).
+    """
+    from mathutils import Vector
+
+    # Collect unique key times from all pose-bone F-curves
+    frames = set()
+    for fc in _iter_all_fcurves(action):
+        if not fc.data_path.startswith('pose.bones["'):
+            continue
+        for kp in fc.keyframe_points:
+            frames.add(round(kp.co.x, 6))
+    if not frames:
+        return 0, set(), 0
+
+    sorted_frames = sorted(frames)
+
+    # Identify root bone(s) – we will apply the corrective translation to them
+    root_names = []
+    arm = obj.data
+    for bone in arm.bones:
+        if _is_root_bone(bone.name):
+            root_names.append(bone.name)
+    if not root_names:
+        # Fallback: first bone that has a location channel
+        for fc in _iter_all_fcurves(action):
+            if ".location" in fc.data_path and fc.data_path.startswith('pose.bones["'):
+                root_names.append(_bone_name_from_path(fc.data_path))
+                break
+    if not root_names:
+        return 0, set(), 0
+
+    # Ensure we have location F-curves on the root(s) for the axes we care about
+    root_fcs = {}  # (bone_name, axis) -> FCurve
+    for rname in root_names:
+        for axis in axes:
+            path = f'pose.bones["{rname}"].location'
+            fc = _ensure_fcurve(action, obj, path, axis)
+            if fc is not None:
+                root_fcs[(rname, axis)] = fc
+
+    if not root_fcs:
+        return 0, set(), 0
+
+    scene = bpy.context.scene
+    orig_frame = scene.frame_current
+    processed = 0
+    keys_touched = 0
+    bones_adj = set(root_names)
+
+    try:
+        for t in sorted_frames:
+            scene.frame_set(int(round(t)))
+            # Force update so pose matrices are current
+            bpy.context.view_layer.update()
+
+            # Average world-space translation of every pose bone
+            poses = obj.pose.bones
+            if not poses:
+                continue
+            avg = Vector((0.0, 0.0, 0.0))
+            count = 0
+            for pb in poses:
+                avg += pb.matrix.translation
+                count += 1
+            if count == 0:
+                continue
+            avg /= count
+
+            # Only correct the horizontal components
+            delta = Vector((0.0, 0.0, 0.0))
+            if 0 in axes:
+                delta.x = -avg.x
+            if 1 in axes:
+                delta.y = -avg.y
+            # Z deliberately left alone
+
+            if abs(delta.x) < 1e-9 and abs(delta.y) < 1e-9:
+                continue
+
+            # Apply the same delta to every root bone's location F-curve
+            for (rname, axis), fc in root_fcs.items():
+                # Current evaluated value at this frame
+                cur = fc.evaluate(t)
+                new_val = cur + (delta.x if axis == 0 else delta.y)
+
+                # Find or insert a key at this exact frame
+                found = False
+                for kp in fc.keyframe_points:
+                    if abs(kp.co.x - t) < 1e-4:
+                        dy = new_val - kp.co.y
+                        kp.co.y = new_val
+                        kp.handle_left.y += dy
+                        kp.handle_right.y += dy
+                        found = True
+                        keys_touched += 1
+                        break
+                if not found:
+                    # Insert a new key
+                    new_kp = fc.keyframe_points.insert(t, new_val, options={'FAST'})
+                    new_kp.handle_left_type = 'AUTO_CLAMPED'
+                    new_kp.handle_right_type = 'AUTO_CLAMPED'
+                    keys_touched += 1
+
+                fc.update()
+            processed += 1
+    finally:
+        scene.frame_set(orig_frame)
+        bpy.context.view_layer.update()
+
+    return processed, bones_adj, keys_touched
+
+
 def truncate_after_loop(action, obj, start, period):
     fcurves = _get_action_fcurves(action, obj)
     if fcurves is None:
@@ -2147,6 +2289,154 @@ def homogenise_to_period(action, obj, start, period, settings):
             bones.add(bone)
             fc.update()
     return adjusted, bones
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Quaternion Homogenisation helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _collect_quat_fcurves_by_bone(action, obj=None):
+    """
+    Return dict: bone_name -> list of 4 F-Curves (or None) ordered as [W, X, Y, Z].
+    Only bones that have at least one rotation_quaternion channel are included.
+    """
+    by_bone = defaultdict(lambda: [None, None, None, None])
+    for fc in _iter_all_fcurves(action):
+        path = fc.data_path
+        if not path.startswith('pose.bones["') or ".rotation_quaternion" not in path:
+            continue
+        if fc.lock or fc.mute:
+            continue
+        bone = _bone_name_from_path(path)
+        idx = fc.array_index
+        if 0 <= idx <= 3:
+            by_bone[bone][idx] = fc
+    # Drop bones that have zero channels
+    return {b: fcs for b, fcs in by_bone.items() if any(fcs)}
+
+
+def _evaluate_quat_at(fcs, frame):
+    """Evaluate the four quaternion F-Curves at *frame*. Missing channels default to identity."""
+    defaults = (1.0, 0.0, 0.0, 0.0)
+    vals = []
+    for i, fc in enumerate(fcs):
+        if fc is not None:
+            vals.append(fc.evaluate(frame))
+        else:
+            vals.append(defaults[i])
+    return vals  # [w, x, y, z]
+
+
+def _flip_keyframe_point(kp):
+    """Negate value and handles of a single keyframe point (in-place)."""
+    kp.co.y = -kp.co.y
+    kp.handle_left.y = -kp.handle_left.y
+    kp.handle_right.y = -kp.handle_right.y
+
+
+def _homogenise_quat_fcurves(fcs, reference_fcs=None, reference_frames=None):
+    """
+    Make the quaternion trajectory continuous by flipping signs so that
+    consecutive samples have a positive dot product.
+
+    If *reference_fcs* is supplied (another set of 4 F-Curves), each sample
+    is instead forced to lie in the same hemisphere as the reference
+    evaluated at the same frame (source-dominating mode).
+
+    Returns the number of keyframe points that were flipped.
+    """
+    # Collect every unique keyframe time present on any of the four curves
+    frames = set()
+    for fc in fcs:
+        if fc is None:
+            continue
+        for kp in fc.keyframe_points:
+            frames.add(round(kp.co.x, 6))  # avoid tiny float noise
+    if not frames:
+        return 0
+
+    sorted_frames = sorted(frames)
+
+    # Decide for each frame whether a flip is required
+    need_flip = {}
+    prev_q = None
+
+    for t in sorted_frames:
+        q = _evaluate_quat_at(fcs, t)
+
+        if reference_fcs is not None:
+            # Source-dominating: match the hemisphere of the reference
+            ref_q = _evaluate_quat_at(reference_fcs, t)
+            # Dot product; if negative, flip this sample
+            dot = q[0]*ref_q[0] + q[1]*ref_q[1] + q[2]*ref_q[2] + q[3]*ref_q[3]
+            need_flip[t] = dot < 0.0
+        else:
+            # Self-homogenise: keep consecutive samples in the same hemisphere
+            if prev_q is None:
+                need_flip[t] = False
+            else:
+                dot = q[0]*prev_q[0] + q[1]*prev_q[1] + q[2]*prev_q[2] + q[3]*prev_q[3]
+                need_flip[t] = dot < 0.0
+            # Update the running previous quaternion (after possible flip)
+            if need_flip[t]:
+                prev_q = [-v for v in q]
+            else:
+                prev_q = q
+
+    # Apply the flips to the actual keyframe points
+    flipped = 0
+    for fc in fcs:
+        if fc is None:
+            continue
+        changed = False
+        for kp in fc.keyframe_points:
+            t = round(kp.co.x, 6)
+            if need_flip.get(t, False):
+                _flip_keyframe_point(kp)
+                flipped += 1
+                changed = True
+        if changed:
+            fc.update()
+
+    return flipped
+
+
+def homogenise_action_quaternions(action, obj=None, reference_action=None, reference_obj=None):
+    """
+    Homogenise every quaternion rotation channel in *action*.
+
+    If *reference_action* is given, each bone's quaternions are forced into
+    the same hemisphere as the corresponding bone in the reference action
+    (source-dominating mode). Otherwise the action is made self-consistent
+    (consecutive keyframes keep a positive dot product).
+
+    Returns (bones_processed, total_flipped_keys).
+    """
+    bone_fcs = _collect_quat_fcurves_by_bone(action, obj)
+    if not bone_fcs:
+        return 0, 0
+
+    ref_bone_fcs = None
+    if reference_action is not None:
+        ref_bone_fcs = _collect_quat_fcurves_by_bone(reference_action, reference_obj)
+
+    bones_done = 0
+    total_flipped = 0
+
+    for bone_name, fcs in bone_fcs.items():
+        ref_fcs = None
+        if ref_bone_fcs is not None:
+            ref_fcs = ref_bone_fcs.get(bone_name)
+            # If the bone does not exist in the reference, fall back to self-homogenise
+            if ref_fcs is None or not any(ref_fcs):
+                ref_fcs = None
+
+        flipped = _homogenise_quat_fcurves(fcs, reference_fcs=ref_fcs)
+        if flipped:
+            bones_done += 1
+            total_flipped += flipped
+
+    return bones_done, total_flipped
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2341,16 +2631,142 @@ class ANIMSHORTCUTS_OT_homogenise(Operator):
         )
 
 
+class ANIMSHORTCUTS_OT_homogenise_rotation(Operator):
+    """Make quaternion rotations continuous within the active Action.
+
+    Consecutive keyframes are forced to have a positive dot-product so that
+    Blender's component-wise interpolation never takes the long way around
+    (the classic "rapid spin" artefact).
+    """
+    bl_idname = "animshortcuts.homogenise_rotation"
+    bl_label = "Homogenise Rotation (Active)"
+    bl_description = (
+        "Flip quaternion signs on the active Action so consecutive keyframes "
+        "stay in the same hemisphere. Eliminates unwanted 360° spins caused "
+        "by interpolating between q and -q."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            self.report({'WARNING'}, "No active Action")
+            return {'CANCELLED'}
+
+        action = obj.animation_data.action
+        bpy.ops.ed.undo_push(message="Homogenise Rotation (Active)")
+
+        bones, flipped = homogenise_action_quaternions(action, obj)
+
+        if flipped == 0:
+            self.report({'INFO'}, "No quaternion flips were needed – already continuous")
+        else:
+            self.report(
+                {'INFO'},
+                f"Homogenised rotation: flipped {flipped} key(s) on {bones} bone(s)"
+            )
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
+            and not _is_transform_running()
+        )
+
+
+class ANIMSHORTCUTS_OT_homogenise_rotation_to_source(Operator):
+    """Align quaternion signs of a target Action to the active (source) Action.
+
+    For every bone that exists in both Actions, each keyframe of the target
+    is forced into the same quaternion hemisphere as the source evaluated at
+    the same frame. This makes the target follow the "dominating" orientation
+    established by the source.
+    """
+    bl_idname = "animshortcuts.homogenise_rotation_to_source"
+    bl_label = "Homogenise Target to Source"
+    bl_description = (
+        "Flip quaternion signs on the chosen Target Action so they match the "
+        "hemisphere of the active (source) Action at the same frames."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            self.report({'WARNING'}, "No active (source) Action")
+            return {'CANCELLED'}
+
+        src_action = obj.animation_data.action
+        settings = context.window_manager.anim_shortcuts_settings
+        target_name = settings.homogenize_target_action
+
+        if not target_name or target_name == "NONE":
+            self.report({'WARNING'}, "Choose a Homogenize Target Action in the dropdown")
+            return {'CANCELLED'}
+
+        tgt_action = bpy.data.actions.get(target_name)
+        if tgt_action is None:
+            self.report({'WARNING'}, f"Action '{target_name}' no longer exists")
+            return {'CANCELLED'}
+
+        if tgt_action == src_action:
+            self.report({'WARNING'}, "Source and Target are the same Action – use the Active button instead")
+            return {'CANCELLED'}
+
+        bpy.ops.ed.undo_push(message="Homogenise Target Rotation to Source")
+
+        bones, flipped = homogenise_action_quaternions(
+            tgt_action, obj,
+            reference_action=src_action, reference_obj=obj
+        )
+
+        if flipped == 0:
+            self.report(
+                {'INFO'},
+                f"No flips needed – '{tgt_action.name}' already matches source orientation"
+            )
+        else:
+            self.report(
+                {'INFO'},
+                f"Aligned '{tgt_action.name}' to source: flipped {flipped} key(s) on {bones} bone(s)"
+            )
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
+            and not _is_transform_running()
+        )
+
+
 class ANIMSHORTCUTS_OT_copy_bones_to_action(Operator):
     """Copy all keyframes of the selected pose bones from the active Action
     into the Action chosen in the Target Action dropdown.
-    Existing keyframes on matching channels in the target are replaced.
+
+    Only keyframes that fall inside the source curve's frame range are
+    overwritten. Existing keyframes on the target that lie completely
+    outside that range are preserved.
     """
     bl_idname = "animshortcuts.copy_bones_to_action"
     bl_label = "Copy Selected Bones Keyframes"
     bl_description = (
         "Copy every keyframe belonging to the currently selected bones "
-        "from the active Action into the Target Action selected above"
+        "from the active Action into the Target Action. Keyframes on the "
+        "target that do not overlap the source frame range are preserved."
     )
     bl_options = {'REGISTER', 'UNDO'}
 
@@ -2446,6 +2862,66 @@ class ANIMSHORTCUTS_OT_copy_bones_to_action(Operator):
             obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
             and obj.animation_data and obj.animation_data.action
             and context.selected_pose_bones
+            and not _is_transform_running()
+        )
+
+
+
+class ANIMSHORTCUTS_OT_center_character(Operator):
+    """Recenter the whole character on every keyframe (horizontal only).
+
+    Computes the average world-space position of all pose bones at each
+    unique keyframe, then counter-shifts the root bone(s) so the character
+    sits at the origin in X/Y.  Vertical (Z) motion is left completely free.
+    """
+    bl_idname = "animshortcuts.center_character"
+    bl_label = "Center Character (Zero X/Y)"
+    bl_description = (
+        "At every keyframe, shift the root bone(s) so the character's "
+        "average position is at the world origin in X and Y. "
+        "Up/down (Z) is never touched. Use when the body drifts away "
+        "from the origin even though the root itself stays near zero."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            self.report({'WARNING'}, "No active Action")
+            return {'CANCELLED'}
+
+        action = obj.animation_data.action
+        bpy.ops.ed.undo_push(message="Center Character Horizontal")
+
+        processed, bones, keys = center_character_horizontal(action, obj, axes=(0, 1))
+
+        if processed == 0:
+            self.report(
+                {'INFO'},
+                "Nothing to do – character already centred or no usable keys found"
+            )
+        else:
+            bone_list = ", ".join(sorted(bones)[:6])
+            if len(bones) > 6:
+                bone_list += f" … (+{len(bones)-6} more)"
+            self.report(
+                {'INFO'},
+                f"Centred {processed} frame(s), touched {keys} key(s) on root bone(s): {bone_list}"
+            )
+
+        context.scene.frame_set(context.scene.frame_current)
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
             and not _is_transform_running()
         )
 
@@ -2725,6 +3201,46 @@ class ANIMSHORTCUTS_PT_panel(Panel):
         info.label(text="Prefer Period ≈ length of ONE walk cycle", icon='INFO')
         info.label(text="Homogenise forces later cycles to match the first", icon='INFO')
 
+        # ── Quaternion Homogenisation ───────────────────────────────────────
+        layout.separator()
+        box = layout.box()
+        box.label(text="Quaternion Homogenisation", icon='CON_ROTLIKE')
+        col = box.column(align=True)
+        col.scale_y = 1.3
+        col.operator(
+            "animshortcuts.homogenise_rotation",
+            text="Homogenise Rotation (Active)",
+            icon='MOD_SMOOTH',
+        )
+        col.separator()
+        col.prop(settings, "homogenize_target_action", text="Target")
+        col.operator(
+            "animshortcuts.homogenise_rotation_to_source",
+            text="Homogenise Target to Source",
+            icon='UV_SYNC_SELECT',
+        )
+        box.label(
+            text="Flips q ↔ –q so interpolation never takes the long spin",
+            icon='INFO',
+        )
+
+
+        # ── Character Centering ─────────────────────────────────────────────
+        layout.separator()
+        box = layout.box()
+        box.label(text="Character Centering", icon='PIVOT_CURSOR')
+        col = box.column(align=True)
+        col.scale_y = 1.3
+        col.operator(
+            "animshortcuts.center_character",
+            text="Center Character (Zero X/Y)",
+            icon='PIVOT_CURSOR',
+        )
+        box.label(
+            text="Shifts root so the body average is at origin in X/Y. Z free.",
+            icon='INFO',
+        )
+
         # ── Copy Keyframes to another Action ────────────────────────────────
         layout.separator()
         box = layout.box()
@@ -2738,7 +3254,7 @@ class ANIMSHORTCUTS_PT_panel(Panel):
             icon='COPYDOWN',
         )
         box.label(
-            text="Copies all keys of selected bones from the active Action",
+            text="Copies keys of selected bones; non-overlapping target keys are kept",
             icon='INFO',
         )
 
@@ -2776,7 +3292,10 @@ classes = (
     ANIMSHORTCUTS_OT_detect_loop,
     ANIMSHORTCUTS_OT_detect_truncate_loop,
     ANIMSHORTCUTS_OT_homogenise,
+    ANIMSHORTCUTS_OT_homogenise_rotation,
+    ANIMSHORTCUTS_OT_homogenise_rotation_to_source,
     ANIMSHORTCUTS_OT_copy_bones_to_action,
+    ANIMSHORTCUTS_OT_center_character,
     LIVEOFFSET_PT_panel,
     TRANSFORMSHORTCUTS_PT_panel,
     ANIMSHORTCUTS_PT_panel,
