@@ -233,7 +233,7 @@ def collect_offsets(context):
             if abs(offset) < 1e-9:
                 continue
 
-            pending.append((fc, offset, data_path, array_index, bone.name))
+            pending.append((fc, offset, live_val, data_path, array_index, bone.name))
 
     return pending
 
@@ -252,6 +252,31 @@ def apply_offsets(pending, selected_only=False):
             kp.co.y += offset
             kp.handle_left.y += offset
             kp.handle_right.y += offset
+            changed = True
+        if changed:
+            fc.update()
+
+
+def apply_relative_offsets(pending, selected_only=False):
+    """Drive every (selected) keyframe to the current live value.
+
+    For a key at time t the per-key offset is live − keyed@t
+    (i.e. relative to that key's own value, not to the playhead).
+    Keys that already sit on the playhead therefore receive the full
+    absolute offset; all other keys are brought to the live pose.
+    Handle shape relative to each control point is preserved.
+    """
+    for fc, _offset, live_val, *_ in pending:
+        changed = False
+        for kp in fc.keyframe_points:
+            if selected_only and not kp.select_control_point:
+                continue
+            dy = live_val - kp.co.y
+            if abs(dy) < 1e-12:
+                continue
+            kp.co.y += dy
+            kp.handle_left.y += dy
+            kp.handle_right.y += dy
             changed = True
         if changed:
             fc.update()
@@ -785,7 +810,7 @@ class LIVEOFFSET_OT_apply(Operator):
         context.scene.frame_set(context.scene.frame_current)
         sync_offsets_from_bone(context)
 
-        bones = {p[4] for p in pending}
+        bones = {p[5] for p in pending}
         self.report({'INFO'}, f"Shifted {len(pending)} channel(s) across {len(bones)} bone(s) (all keyframes)")
         return {'FINISHED'}
 
@@ -831,10 +856,105 @@ class LIVEOFFSET_OT_apply_selected(Operator):
         context.scene.frame_set(context.scene.frame_current)
         sync_offsets_from_bone(context)
 
-        bones = {p[4] for p in pending}
+        bones = {p[5] for p in pending}
         self.report(
             {'INFO'},
             f"Shifted {selected_count} selected keyframe(s) across {len(pending)} channel(s) / {len(bones)} bone(s)"
+        )
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
+            and context.selected_pose_bones and not _is_transform_running()
+        )
+
+
+class LIVEOFFSET_OT_apply_relative(Operator):
+    bl_idname = "liveoffset.apply_relative"
+    bl_label = "Apply Relative Offset to All"
+    bl_description = (
+        "Drive every keyframe on the affected channels to the current live pose value. "
+        "Keys on the playhead receive the full offset; keys at other times receive an "
+        "offset relative to their own keyed value (live − keyed@t). Handle shape is preserved."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        pending = collect_offsets(context)
+        if not pending:
+            self.report({'INFO'}, "Nothing to do – all offsets are zero")
+            return {'CANCELLED'}
+
+        bpy.ops.ed.undo_push(message="Live Relative Offset (All)")
+        apply_relative_offsets(pending, selected_only=False)
+        context.scene.frame_set(context.scene.frame_current)
+        sync_offsets_from_bone(context)
+
+        bones = {p[5] for p in pending}
+        self.report(
+            {'INFO'},
+            f"Relative-offset applied to {len(pending)} channel(s) across {len(bones)} bone(s) (all keyframes)"
+        )
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
+            and context.selected_pose_bones and not _is_transform_running()
+        )
+
+
+class LIVEOFFSET_OT_apply_relative_selected(Operator):
+    bl_idname = "liveoffset.apply_relative_selected"
+    bl_label = "Apply Relative Offset to Selected"
+    bl_description = (
+        "Drive only the currently selected keyframes to the current live pose value. "
+        "Keys on the playhead receive the full offset; other selected keys receive an "
+        "offset relative to their own keyed value (live − keyed@t). Handle shape is preserved."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        pending = collect_offsets(context)
+        if not pending:
+            self.report({'INFO'}, "Nothing to do – all offsets are zero")
+            return {'CANCELLED'}
+
+        selected_count = 0
+        for fc, *_ in pending:
+            for kp in fc.keyframe_points:
+                if kp.select_control_point:
+                    selected_count += 1
+
+        if selected_count == 0:
+            self.report({'WARNING'}, "No selected keyframes found on the offset channels")
+            return {'CANCELLED'}
+
+        bpy.ops.ed.undo_push(message="Live Relative Offset (Selected)")
+        apply_relative_offsets(pending, selected_only=True)
+        context.scene.frame_set(context.scene.frame_current)
+        sync_offsets_from_bone(context)
+
+        bones = {p[5] for p in pending}
+        self.report(
+            {'INFO'},
+            f"Relative-offset applied to {selected_count} selected keyframe(s) "
+            f"across {len(pending)} channel(s) / {len(bones)} bone(s)"
         )
         return {'FINISHED'}
 
@@ -1888,8 +2008,15 @@ def _is_root_bone(bone_name):
 
 
 def _bone_name_from_path(data_path):
+    """Extract the bone name from a pose-bone data_path.
+    Handles both double- and single-quoted forms.
+    """
     if data_path.startswith('pose.bones["'):
         end = data_path.find('"]')
+        if end != -1:
+            return data_path[12:end]
+    if data_path.startswith("pose.bones['"):
+        end = data_path.find("']")
         if end != -1:
             return data_path[12:end]
     return data_path
@@ -2119,16 +2246,27 @@ def get_action_total_length(context):
 
 def center_character_horizontal(action, obj, axes=(0, 1)):
     """
-    For every unique keyframe in the Action, compute the average world-space
-    horizontal position of all pose bones and counter-shift the root bone(s)
-    so that the character's centre sits at the origin in X/Y.
+    Center a Rigify (or similar) character horizontally relative to the root.
 
-    Vertical (Z) motion is left completely free.
+    Only high-level control bones that the animator actually keys are touched.
+    Priority:
+      1. torso
+      2. hips
+      3. other direct children of root that look like controls
+      4. other non-technical bones with non-zero location keys (last resort)
+
+    Technical bones (ORG-, DEF-, MCH-, tweak, etc.) and the root itself
+    are never modified.
+
+    When writing a key the bone's location axis is first reset to 0 and the
+    view layer is updated so no ghost / residual pose values are baked in.
+    Z is never touched.
+
     Returns (frames_processed, bones_adjusted, keys_touched).
     """
     from mathutils import Vector
 
-    # Collect unique key times from all pose-bone F-curves
+    # Collect unique key times
     frames = set()
     for fc in _iter_all_fcurves(action):
         if not fc.data_path.startswith('pose.bones["'):
@@ -2137,103 +2275,189 @@ def center_character_horizontal(action, obj, axes=(0, 1)):
             frames.add(round(kp.co.x, 6))
     if not frames:
         return 0, set(), 0
-
     sorted_frames = sorted(frames)
 
-    # Identify root bone(s) – we will apply the corrective translation to them
-    root_names = []
-    arm = obj.data
-    for bone in arm.bones:
+    # Root detection
+    root_names = set()
+    for bone in obj.data.bones:
         if _is_root_bone(bone.name):
-            root_names.append(bone.name)
-    if not root_names:
-        # Fallback: first bone that has a location channel
-        for fc in _iter_all_fcurves(action):
-            if ".location" in fc.data_path and fc.data_path.startswith('pose.bones["'):
-                root_names.append(_bone_name_from_path(fc.data_path))
-                break
-    if not root_names:
+            root_names.add(bone.name)
+
+    primary_root_name = None
+    for name in sorted(root_names):
+        if name in obj.pose.bones:
+            primary_root_name = name
+            break
+    if primary_root_name is None:
+        # Rigify almost always has a bone literally named "root"
+        if "root" in obj.pose.bones:
+            primary_root_name = "root"
+            root_names.add("root")
+    if primary_root_name is None:
         return 0, set(), 0
 
-    # Ensure we have location F-curves on the root(s) for the axes we care about
-    root_fcs = {}  # (bone_name, axis) -> FCurve
-    for rname in root_names:
-        for axis in axes:
-            path = f'pose.bones["{rname}"].location'
-            fc = _ensure_fcurve(action, obj, path, axis)
-            if fc is not None:
-                root_fcs[(rname, axis)] = fc
+    def _is_technical(name):
+        """Bones that must never be touched."""
+        lower = name.lower()
+        if lower in root_names or name in root_names:
+            return True
+        prefixes = ("org-", "def-", "mch-", "vis_", "wgt-")
+        if any(lower.startswith(p) or name.startswith(p.upper()) or name.startswith(p) for p in prefixes):
+            return True
+        tokens = ("tweak", "twk", "adj", "adjust", "corrective", "fix", "helper",
+                  "driver", "mechanism", "parent")
+        return any(tok in lower for tok in tokens)
 
-    if not root_fcs:
+    # Preferred control bones (Rigify order)
+    preferred = ["torso", "hips", "chest", "spine_fk", "spine"]
+
+    # Gather all location F-curves that belong to non-technical bones
+    # and that have at least one non-zero key on the axes we care about.
+    candidates = {}  # bone_name -> {axis: FCurve}
+    for fc in _iter_all_fcurves(action):
+        path = fc.data_path
+        if not path.startswith('pose.bones["') or ".location" not in path:
+            continue
+        if fc.lock or fc.mute or fc.array_index not in axes:
+            continue
+        bone_name = _bone_name_from_path(path)
+        if _is_technical(bone_name):
+            continue
+        has_nonzero = any(abs(kp.co.y) > 1e-6 for kp in fc.keyframe_points)
+        if not has_nonzero:
+            continue
+        candidates.setdefault(bone_name, {})[fc.array_index] = fc
+
+    if not candidates:
+        return 0, set(), 0
+
+    # Decide which bones to actually correct (priority list)
+    target_bones = []
+    for name in preferred:
+        if name in candidates:
+            target_bones.append(name)
+            break  # prefer a single main control (torso or hips)
+
+    if not target_bones:
+        # Fallback: direct children of root that are in candidates
+        root_data = obj.data.bones.get(primary_root_name)
+        if root_data:
+            for child in root_data.children:
+                if child.name in candidates:
+                    target_bones.append(child.name)
+        # Still nothing? take any remaining candidates (last resort)
+        if not target_bones:
+            target_bones = list(candidates.keys())
+
+    # Build the final fcurve map only for the chosen bones
+    body_fcs = {}
+    for bname in target_bones:
+        for axis, fc in candidates[bname].items():
+            body_fcs[(bname, axis)] = fc
+
+    if not body_fcs:
         return 0, set(), 0
 
     scene = bpy.context.scene
     orig_frame = scene.frame_current
     processed = 0
     keys_touched = 0
-    bones_adj = set(root_names)
+    bones_adj = set()
 
     try:
         for t in sorted_frames:
             scene.frame_set(int(round(t)))
-            # Force update so pose matrices are current
             bpy.context.view_layer.update()
 
-            # Average world-space translation of every pose bone
-            poses = obj.pose.bones
-            if not poses:
+            root_pb = obj.pose.bones.get(primary_root_name)
+            if root_pb is None:
                 continue
-            avg = Vector((0.0, 0.0, 0.0))
+            root_pos = root_pb.matrix.translation.copy()
+
+            # Average relative position of the *chosen* control bones
+            avg_rel = Vector((0.0, 0.0, 0.0))
             count = 0
-            for pb in poses:
-                avg += pb.matrix.translation
+            for bname in target_bones:
+                pb = obj.pose.bones.get(bname)
+                if pb is None:
+                    continue
+                rel = pb.matrix.translation - root_pos
+                avg_rel += rel
                 count += 1
             if count == 0:
                 continue
-            avg /= count
+            avg_rel /= count
 
-            # Only correct the horizontal components
-            delta = Vector((0.0, 0.0, 0.0))
+            world_delta = Vector((0.0, 0.0, 0.0))
             if 0 in axes:
-                delta.x = -avg.x
+                world_delta.x = -avg_rel.x
             if 1 in axes:
-                delta.y = -avg.y
-            # Z deliberately left alone
+                world_delta.y = -avg_rel.y
 
-            if abs(delta.x) < 1e-9 and abs(delta.y) < 1e-9:
+            if abs(world_delta.x) < 1e-9 and abs(world_delta.y) < 1e-9:
                 continue
 
-            # Apply the same delta to every root bone's location F-curve
-            for (rname, axis), fc in root_fcs.items():
-                # Current evaluated value at this frame
-                cur = fc.evaluate(t)
-                new_val = cur + (delta.x if axis == 0 else delta.y)
+            for bname in target_bones:
+                pb = obj.pose.bones.get(bname)
+                if pb is None:
+                    continue
 
-                # Find or insert a key at this exact frame
-                found = False
-                for kp in fc.keyframe_points:
-                    if abs(kp.co.x - t) < 1e-4:
-                        dy = new_val - kp.co.y
-                        kp.co.y = new_val
-                        kp.handle_left.y += dy
-                        kp.handle_right.y += dy
-                        found = True
+                # world → local
+                parent = pb.parent
+                if parent is not None:
+                    try:
+                        local_delta = parent.matrix.inverted().to_3x3() @ world_delta
+                    except Exception:
+                        local_delta = world_delta.copy()
+                else:
+                    local_delta = world_delta.copy()
+
+                for axis in axes:
+                    key = (bname, axis)
+                    fc = body_fcs.get(key)
+                    if fc is None:
+                        continue
+
+                    axis_delta = local_delta[axis]
+                    if abs(axis_delta) < 1e-9:
+                        continue
+
+                    # ----- clean key writing -----
+                    old_loc = pb.location.copy()
+                    pb.location[axis] = 0.0
+                    bpy.context.view_layer.update()
+
+                    pure_curve_val = fc.evaluate(t)
+                    new_val = pure_curve_val + axis_delta
+
+                    pb.location = old_loc  # restore
+
+                    found = False
+                    for kp in fc.keyframe_points:
+                        if abs(kp.co.x - t) < 1e-4:
+                            dy = new_val - kp.co.y
+                            kp.co.y = new_val
+                            kp.handle_left.y += dy
+                            kp.handle_right.y += dy
+                            found = True
+                            keys_touched += 1
+                            break
+                    if not found and len(fc.keyframe_points) > 0:
+                        new_kp = fc.keyframe_points.insert(t, new_val, options={'FAST'})
+                        new_kp.handle_left_type = 'AUTO_CLAMPED'
+                        new_kp.handle_right_type = 'AUTO_CLAMPED'
                         keys_touched += 1
-                        break
-                if not found:
-                    # Insert a new key
-                    new_kp = fc.keyframe_points.insert(t, new_val, options={'FAST'})
-                    new_kp.handle_left_type = 'AUTO_CLAMPED'
-                    new_kp.handle_right_type = 'AUTO_CLAMPED'
-                    keys_touched += 1
 
-                fc.update()
+                    fc.update()
+                bones_adj.add(bname)
+
             processed += 1
     finally:
         scene.frame_set(orig_frame)
         bpy.context.view_layer.update()
 
     return processed, bones_adj, keys_touched
+
 
 
 def truncate_after_loop(action, obj, start, period):
@@ -2910,7 +3134,374 @@ class ANIMSHORTCUTS_OT_center_character(Operator):
                 bone_list += f" … (+{len(bones)-6} more)"
             self.report(
                 {'INFO'},
-                f"Centred {processed} frame(s), touched {keys} key(s) on root bone(s): {bone_list}"
+                f"Centred {processed} frame(s), touched {keys} key(s) on body bone(s): {bone_list}"
+            )
+
+        context.scene.frame_set(context.scene.frame_current)
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
+            and not _is_transform_running()
+        )
+
+
+
+def _clear_keys_matching(action, name_predicate, obj=None):
+    """
+    Remove every keyframe (and the F-Curve itself if emptied) whose bone name
+    matches *name_predicate(bone_name) -> bool*.
+
+    Prefer the channelbag belonging to *obj*'s current action slot (critical for
+    Blender 4.4+/5.x slotted Actions). Fall back to a full scan of every
+    layer/strip/channelbag so nothing is missed.
+
+    Returns (channels_cleared, keys_removed, bone_names_set).
+    """
+    to_clear = []          # list of (collection, fc)
+    bones = set()
+    seen = set()           # (data_path, array_index) – avoid double-processing
+
+    def _consider(collection, fc):
+        path = fc.data_path
+        # Accept both double- and single-quoted data paths
+        if not (path.startswith('pose.bones["') or path.startswith("pose.bones['")):
+            return
+        bone = _bone_name_from_path(path)
+        if not name_predicate(bone):
+            return
+        key = (path, fc.array_index)
+        if key in seen:
+            return
+        seen.add(key)
+        to_clear.append((collection, fc))
+        bones.add(bone)
+
+    # ------------------------------------------------------------------
+    # 1. Prefer the active object's own slot (most important path)
+    # ------------------------------------------------------------------
+    if obj is not None:
+        try:
+            from bpy_extras import anim_utils
+            anim_data = obj.animation_data
+            slot = getattr(anim_data, "action_slot", None) if anim_data else None
+            if slot is not None:
+                bag = anim_utils.action_get_channelbag_for_slot(action, slot)
+                if bag is not None:
+                    for fc in list(bag.fcurves):
+                        _consider(bag.fcurves, fc)
+        except Exception:
+            pass
+
+        # Also try the helper that already understands slots / legacy proxy
+        fcurves = _get_action_fcurves(action, obj)
+        if fcurves is not None:
+            for fc in list(fcurves):
+                _consider(fcurves, fc)
+
+    # ------------------------------------------------------------------
+    # 2. Legacy top-level fcurves (first slot proxy)
+    # ------------------------------------------------------------------
+    legacy = getattr(action, "fcurves", None)
+    if legacy is not None:
+        try:
+            for fc in list(legacy):
+                _consider(legacy, fc)
+        except (TypeError, AttributeError):
+            pass
+
+    # ------------------------------------------------------------------
+    # 3. Full scan of every layer / strip / channelbag
+    # ------------------------------------------------------------------
+    for layer in getattr(action, "layers", []) or []:
+        for strip in getattr(layer, "strips", []) or []:
+            bags = getattr(strip, "channelbags", None)
+            if bags:
+                for bag in bags:
+                    for fc in list(bag.fcurves):
+                        _consider(bag.fcurves, fc)
+            else:
+                for slot in getattr(action, "slots", []) or []:
+                    try:
+                        bag = strip.channelbag(slot)
+                    except Exception:
+                        bag = None
+                    if bag is not None:
+                        for fc in list(bag.fcurves):
+                            _consider(bag.fcurves, fc)
+
+    # ------------------------------------------------------------------
+    # 4. Ultimate fallback – walk every slot via anim_utils
+    # ------------------------------------------------------------------
+    try:
+        from bpy_extras import anim_utils
+        for slot in getattr(action, "slots", []) or []:
+            bag = anim_utils.action_get_channelbag_for_slot(action, slot)
+            if bag is not None:
+                for fc in list(bag.fcurves):
+                    _consider(bag.fcurves, fc)
+    except Exception:
+        pass
+
+    # ------------------------------------------------------------------
+    # Remove keyframes + empty F-Curves
+    # ------------------------------------------------------------------
+    keys_removed = 0
+    channels = 0
+    for collection, fc in to_clear:
+        n = len(fc.keyframe_points)
+        if n == 0:
+            continue
+        while len(fc.keyframe_points):
+            fc.keyframe_points.remove(fc.keyframe_points[0])
+        keys_removed += n
+        channels += 1
+        try:
+            collection.remove(fc)
+        except Exception:
+            pass
+
+    return channels, keys_removed, bones
+
+
+def _is_tweak_bone(name):
+    """True for any bone whose name indicates a tweak / twk control.
+    Catches Rigify-style (forearm_tweak.L, upper_arm_tweak.R.001, …)
+    as well as shorter 'twk' abbreviations.
+    """
+    lower = name.lower()
+    return any(tok in lower for tok in (
+        "tweak", "twk",
+    ))
+
+
+def _is_fk_bone(name):
+    lower = name.lower()
+    # Rigify FK controls: upper_arm_fk.L, thigh_fk.R, spine_fk, hand_fk, etc.
+    if "_fk" in lower or lower.endswith(".fk") or lower.startswith("fk_"):
+        return True
+    # Also catch plain "fk" token as a whole word-ish match
+    parts = lower.replace(".", " ").replace("_", " ").split()
+    return "fk" in parts
+
+
+class ANIMSHORTCUTS_OT_clear_tweak_keys(Operator):
+    """Delete every keyframe that belongs to a tweak bone."""
+    bl_idname = "animshortcuts.clear_tweak_keys"
+    bl_label = "Clear Tweak Keyframes"
+    bl_description = (
+        "Remove all keyframes on bones whose names contain 'tweak' / 'twk'. "
+        "Useful for cleaning up accidental tweak animation."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            self.report({'WARNING'}, "No active Action")
+            return {'CANCELLED'}
+
+        action = obj.animation_data.action
+        bpy.ops.ed.undo_push(message="Clear Tweak Keyframes")
+
+        channels, keys, bones = _clear_keys_matching(action, _is_tweak_bone, obj=obj)
+
+        if keys == 0:
+            self.report({'INFO'}, "No tweak keyframes found")
+        else:
+            bone_list = ", ".join(sorted(bones)[:8])
+            if len(bones) > 8:
+                bone_list += f" … (+{len(bones)-8} more)"
+            self.report(
+                {'INFO'},
+                f"Cleared {keys} key(s) on {channels} channel(s) / {len(bones)} tweak bone(s): {bone_list}"
+            )
+
+        context.scene.frame_set(context.scene.frame_current)
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
+            and not _is_transform_running()
+        )
+
+
+class ANIMSHORTCUTS_OT_clear_fk_keys(Operator):
+    """Delete every keyframe that belongs to an FK bone."""
+    bl_idname = "animshortcuts.clear_fk_keys"
+    bl_label = "Clear FK Keyframes"
+    bl_description = (
+        "Remove all keyframes on FK control bones (names containing '_fk', "
+        "'.fk', etc.). Useful after switching to IK or cleaning FK animation."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            self.report({'WARNING'}, "No active Action")
+            return {'CANCELLED'}
+
+        action = obj.animation_data.action
+        bpy.ops.ed.undo_push(message="Clear FK Keyframes")
+
+        channels, keys, bones = _clear_keys_matching(action, _is_fk_bone, obj=obj)
+
+        if keys == 0:
+            self.report({'INFO'}, "No FK keyframes found")
+        else:
+            bone_list = ", ".join(sorted(bones)[:8])
+            if len(bones) > 8:
+                bone_list += f" … (+{len(bones)-8} more)"
+            self.report(
+                {'INFO'},
+                f"Cleared {keys} key(s) on {channels} channel(s) / {len(bones)} FK bone(s): {bone_list}"
+            )
+
+        context.scene.frame_set(context.scene.frame_current)
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
+            and not _is_transform_running()
+        )
+
+
+
+def _is_finger_bone(name):
+    """Individual finger bones (NOT the master controls).
+    Matches: f_index.01.L, f_middle.02.R, thumb.03.L, palm.01.L, etc.
+    Excludes anything containing 'master'.
+    """
+    lower = name.lower()
+    if "master" in lower:
+        return False
+    # Rigify finger / palm patterns
+    finger_tokens = (
+        "f_index", "f_middle", "f_ring", "f_pinky",
+        "thumb", "palm",
+    )
+    return any(tok in lower for tok in finger_tokens)
+
+
+def _is_finger_master(name):
+    """Finger master controls only.
+    Matches: f_index.01_master.L, thumb.01_master.R, etc.
+    """
+    lower = name.lower()
+    if "master" not in lower:
+        return False
+    finger_tokens = (
+        "f_index", "f_middle", "f_ring", "f_pinky",
+        "thumb", "palm",
+    )
+    return any(tok in lower for tok in finger_tokens)
+
+
+class ANIMSHORTCUTS_OT_clear_finger_keys(Operator):
+    """Delete every keyframe on individual finger bones (masters are kept)."""
+    bl_idname = "animshortcuts.clear_finger_keys"
+    bl_label = "Clear Finger Keyframes"
+    bl_description = (
+        "Remove all keyframes on individual finger bones "
+        "(f_index, f_middle, f_ring, f_pinky, thumb, palm). "
+        "Finger master controls are left untouched."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            self.report({'WARNING'}, "No active Action")
+            return {'CANCELLED'}
+
+        action = obj.animation_data.action
+        bpy.ops.ed.undo_push(message="Clear Finger Keyframes")
+
+        channels, keys, bones = _clear_keys_matching(action, _is_finger_bone, obj=obj)
+
+        if keys == 0:
+            self.report({'INFO'}, "No finger keyframes found")
+        else:
+            bone_list = ", ".join(sorted(bones)[:8])
+            if len(bones) > 8:
+                bone_list += f" … (+{len(bones)-8} more)"
+            self.report(
+                {'INFO'},
+                f"Cleared {keys} key(s) on {channels} channel(s) / {len(bones)} finger bone(s): {bone_list}"
+            )
+
+        context.scene.frame_set(context.scene.frame_current)
+        return {'FINISHED'}
+
+    @classmethod
+    def poll(cls, context):
+        obj = context.active_object
+        return (
+            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
+            and obj.animation_data and obj.animation_data.action
+            and not _is_transform_running()
+        )
+
+
+class ANIMSHORTCUTS_OT_clear_finger_master_keys(Operator):
+    """Delete every keyframe on finger master controls."""
+    bl_idname = "animshortcuts.clear_finger_master_keys"
+    bl_label = "Clear Finger Master Keyframes"
+    bl_description = (
+        "Remove all keyframes on finger master controls "
+        "(f_index.01_master, thumb.01_master, etc.)."
+    )
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        if _is_transform_running():
+            self.report({'WARNING'}, "Finish the transform first")
+            return {'CANCELLED'}
+
+        obj = context.active_object
+        if not obj or not obj.animation_data or not obj.animation_data.action:
+            self.report({'WARNING'}, "No active Action")
+            return {'CANCELLED'}
+
+        action = obj.animation_data.action
+        bpy.ops.ed.undo_push(message="Clear Finger Master Keyframes")
+
+        channels, keys, bones = _clear_keys_matching(action, _is_finger_master, obj=obj)
+
+        if keys == 0:
+            self.report({'INFO'}, "No finger-master keyframes found")
+        else:
+            bone_list = ", ".join(sorted(bones)[:8])
+            if len(bones) > 8:
+                bone_list += f" … (+{len(bones)-8} more)"
+            self.report(
+                {'INFO'},
+                f"Cleared {keys} key(s) on {channels} channel(s) / {len(bones)} finger-master bone(s): {bone_list}"
             )
 
         context.scene.frame_set(context.scene.frame_current)
@@ -3041,6 +3632,10 @@ class LIVEOFFSET_PT_panel(Panel):
         col.enabled = not transforming
         col.operator("liveoffset.apply", text="Apply to All Keyframes", icon='CHECKMARK')
         col.operator("liveoffset.apply_selected", text="Apply to Selected Keyframes", icon='RESTRICT_SELECT_OFF')
+
+        col.separator()
+        col.operator("liveoffset.apply_relative", text="Apply Relative Offset to All", icon='CON_TRANSLIKE')
+        col.operator("liveoffset.apply_relative_selected", text="Apply Relative Offset to Selected", icon='RESTRICT_SELECT_OFF')
 
         row = layout.row(align=True)
         row.enabled = not transforming
@@ -3237,7 +3832,38 @@ class ANIMSHORTCUTS_PT_panel(Panel):
             icon='PIVOT_CURSOR',
         )
         box.label(
-            text="Shifts root so the body average is at origin in X/Y. Z free.",
+            text="Centers torso/hips (Rigify controls only, clean keys). Z free.",
+            icon='INFO',
+        )
+
+        # ── Clear Keyframes by Type ─────────────────────────────────────────
+        layout.separator()
+        box = layout.box()
+        box.label(text="Clear Keyframes by Type", icon='KEYFRAME')
+        col = box.column(align=True)
+        col.scale_y = 1.2
+        col.operator(
+            "animshortcuts.clear_tweak_keys",
+            text="Clear Tweak Keyframes",
+            icon='TRASH',
+        )
+        col.operator(
+            "animshortcuts.clear_fk_keys",
+            text="Clear FK Keyframes",
+            icon='TRASH',
+        )
+        col.operator(
+            "animshortcuts.clear_finger_keys",
+            text="Clear Finger Keyframes",
+            icon='TRASH',
+        )
+        col.operator(
+            "animshortcuts.clear_finger_master_keys",
+            text="Clear Finger Master Keyframes",
+            icon='TRASH',
+        )
+        box.label(
+            text="Deletes keys on tweak / FK / finger / finger-master bones.",
             icon='INFO',
         )
 
@@ -3269,6 +3895,8 @@ classes = (
     ANIMSHORTCUTS_PG_settings,
     LIVEOFFSET_OT_apply,
     LIVEOFFSET_OT_apply_selected,
+    LIVEOFFSET_OT_apply_relative,
+    LIVEOFFSET_OT_apply_relative_selected,
     LIVEOFFSET_OT_refresh,
     LIVEOFFSET_OT_reset,
     LIVEOFFSET_OT_copy,
@@ -3296,6 +3924,10 @@ classes = (
     ANIMSHORTCUTS_OT_homogenise_rotation_to_source,
     ANIMSHORTCUTS_OT_copy_bones_to_action,
     ANIMSHORTCUTS_OT_center_character,
+    ANIMSHORTCUTS_OT_clear_tweak_keys,
+    ANIMSHORTCUTS_OT_clear_fk_keys,
+    ANIMSHORTCUTS_OT_clear_finger_keys,
+    ANIMSHORTCUTS_OT_clear_finger_master_keys,
     LIVEOFFSET_PT_panel,
     TRANSFORMSHORTCUTS_PT_panel,
     ANIMSHORTCUTS_PT_panel,
