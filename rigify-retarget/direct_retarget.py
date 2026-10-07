@@ -204,7 +204,31 @@ def _torso_control_mappings(profile_id):
     producing an editable approximation without individual spine FK keys.
     """
     hip_bone = _source_hip_bone(profile_id)
-    mappings = [
+
+    if profile_id == 'MIXAMO':
+        # Root location already comes from the Mixamo base profile (full Hips
+        # translation on root). Only add the high-level orientation controls
+        # here so we do not double-constrain root.
+        #
+        # Chest must be rotation-only. COPY_TRANSFORMS pulls the chest widget
+        # to Spine2's world position; on a deep bend that is far from the
+        # pelvis along a curve, and Rigify's shorter spine chain stretches
+        # to connect them — the elongated torso in the viewport. Orientation
+        # from Spine2 is enough; arm IK / shoulders still drive the limbs.
+        return [
+            {
+                'source': hip_bone,
+                'control': 'hips',
+                'type': COPY_ROTATION,
+            },
+            {
+                'source': _source_spine_bones(profile_id)[-1],
+                'control': 'chest',
+                'type': COPY_ROTATION,
+            },
+        ]
+
+    return [
         {
             'source': hip_bone,
             'control': 'torso',
@@ -221,14 +245,6 @@ def _torso_control_mappings(profile_id):
             'type': COPY_TRANSFORMS,
         },
     ]
-
-    if profile_id == 'MIXAMO':
-        # Mixamo's root mapping sends forward motion to Rigify's root. Keep
-        # the other two axes on the torso and only rotation on the hips so
-        # translation is not inherited twice.
-        mappings[0]['use_y'] = False
-        mappings[1]['type'] = COPY_ROTATION
-    return mappings
 
 
 def _ik_mappings():
@@ -247,39 +263,15 @@ def _ik_driven_mappings(profile_id):
     so they are the reliable source for an IK-authored bake. Rest-relative
     lower-limb motion carries Rigify's pole controls with the source elbow and
     knee plane.
-    """
-    mappings = []
-    if profile_id == 'MIXAMO':
-        mappings.extend(_side_pairs(
-            'mixamorig:LeftHand',
-            'mixamorig:RightHand',
-            'hand_ik.L',
-            'hand_ik.R',
-            COPY_TRANSFORMS,
-        ))
-        mappings.extend(_side_pairs(
-            'mixamorig:LeftFoot',
-            'mixamorig:RightFoot',
-            'foot_ik.L',
-            'foot_ik.R',
-            COPY_TRANSFORMS,
-        ))
-        mappings.extend(_side_pairs(
-            'mixamorig:LeftForeArm',
-            'mixamorig:RightForeArm',
-            'upper_arm_ik_target.L',
-            'upper_arm_ik_target.R',
-            COPY_LOCATION,
-        ))
-        mappings.extend(_side_pairs(
-            'mixamorig:LeftLeg',
-            'mixamorig:RightLeg',
-            'thigh_ik_target.L',
-            'thigh_ik_target.R',
-            COPY_LOCATION,
-        ))
-        return mappings
 
+    Mixamo never uses this path — its limb proportions usually differ from the
+    Rigify target, so world-space IK end effectors misplace elbows and knees.
+    Mixamo always keeps the FK limb mappings from the profile.
+    """
+    if profile_id == 'MIXAMO':
+        return []
+
+    mappings = []
     mappings.extend(_side_pairs(
         'hand_l', 'hand_r', 'hand_ik.L', 'hand_ik.R', COPY_TRANSFORMS))
     mappings.extend(_side_pairs(
@@ -321,6 +313,12 @@ def _is_finger_control(control_name):
 
 def _apply_torso_control_mode(scene, mappings):
     if not getattr(scene, 'udr_torso_controls', False):
+        return mappings
+
+    # Mixamo spine curvature cannot be approximated by hips+chest alone.
+    # Keep the profile's FK spine chain (Spine1/Spine2 → spine_fk) regardless
+    # of the high-level checkbox so deep bends still match the source.
+    if scene.udr_profile == 'MIXAMO':
         return mappings
 
     mappings = [
@@ -373,21 +371,47 @@ def _validate_authoring_controls(scene, source_rig, rigify_rig):
         )
 
 
+def _is_arm_fk_or_tweak_control(control_name):
+    return control_name.startswith((
+        'upper_arm_fk.',
+        'forearm_fk.',
+        'hand_fk.',
+        'upper_arm_tweak.',
+        'forearm_tweak.',
+        'hand_tweak.',
+    ))
+
+
+def _is_leg_fk_or_tweak_control(control_name):
+    return control_name.startswith((
+        'thigh_fk.',
+        'shin_fk.',
+        'foot_fk.',
+        'thigh_tweak.',
+        'shin_tweak.',
+        'foot_tweak.',
+    ))
+
+
 def _apply_drive_mode(scene, mappings):
     if not getattr(scene, 'udr_ik_driven', False):
         return mappings
 
-    # An IK solve and direct FK/tweak transforms must not both drive the same
-    # limb. Keep shoulders, toes, fingers, and torso controls, but replace the
-    # limb FK/tweak links and optional Unreal IK-bone links with a coherent IK
-    # end-effector and pole-control set.
+    profile_id = scene.udr_profile
+
+    # Mixamo always keeps FK limb mappings. World-space IK end effectors
+    # fail when Mixamo and Rigify proportions differ (both arms and legs).
+    if profile_id == 'MIXAMO':
+        return mappings
+
+    # Default: full IK for arms and legs.
     mappings = [
         mapping
         for mapping in mappings
         if mapping['control'] not in IK_END_CONTROLS
         and not _is_limb_fk_or_tweak_control(mapping['control'])
     ]
-    return [*mappings, *_ik_driven_mappings(scene.udr_profile)]
+    return [*mappings, *_ik_driven_mappings(profile_id)]
 
 
 def _ue4_profile():
@@ -481,37 +505,37 @@ def _uefn_profile():
 
 
 def _mixamo_profile():
-    """Return standard namespaced Mixamo-to-Rigify control mappings."""
+    """Return standard namespaced Mixamo-to-Rigify control mappings.
+
+    Hips translation and rotation both go on the torso master control.
+    Putting Hips location on root dragged the whole hierarchy (and the
+    torso cube widget) away from the feet during bends. With FK limbs the
+    leg joints track Mixamo directly, so the body can sit on torso without
+    the IK hip-socket / foot mismatch that forced the root approach earlier.
+
+    Spine1/Spine2 drive the upper FK spine. High-Level Torso Controls are
+    ignored for Mixamo — the hips+chest approximation cannot reproduce
+    Mixamo spine curvature.
+    """
     hips = 'mixamorig:Hips'
     mappings = [
-        # Mixamo stores locomotion and pelvic motion together on Hips. Match
-        # the established Mixaify decomposition: forward motion goes to the
-        # Rigify root while lateral/vertical motion and pelvic rotation stay
-        # on the torso mechanism.
-        {
-            'source': hips,
-            'control': 'root',
-            'type': COPY_LOCATION,
-            'use_x': False,
-            'use_z': False,
-        },
+        # Pelvis translation on torso (not root — avoids dragging the
+        # ground root / torso cube away from planted feet).
         {
             'source': hips,
             'control': 'torso',
             'type': COPY_LOCATION,
-            'use_y': False,
         },
+        # Full pelvic orientation on the torso master (pitch + twist + roll).
         {
             'source': hips,
             'control': 'torso',
             'type': COPY_ROTATION,
-            'use_x': False,
-            'use_z': False,
         },
         {
             'source': 'mixamorig:Spine1',
             'control': 'spine_fk.002',
-            'type': COPY_TRANSFORMS,
+            'type': COPY_ROTATION,
         },
         {
             'source': 'mixamorig:Spine2',
@@ -869,9 +893,14 @@ def _restore_ikfk_state(rigify_rig, state_json):
             bone[IK_FK_PROPERTY] = value
 
 
-def _set_drive_mode(rigify_rig, ik_driven):
+def _set_drive_mode(rigify_rig, ik_driven, profile_id=None):
     # Rigify's IK_FK convention is 0.0 for IK and 1.0 for FK.
-    value = 0.0 if ik_driven else 1.0
+    # Mixamo always stays in FK — its limb proportions do not support
+    # reliable world-space IK retargeting onto a typical Rigify human.
+    if not ik_driven or profile_id == 'MIXAMO':
+        value = 1.0
+    else:
+        value = 0.0
     for bone in rigify_rig.pose.bones:
         if isinstance(bone.get(IK_FK_PROPERTY), float):
             bone[IK_FK_PROPERTY] = value
@@ -1437,8 +1466,14 @@ def _remove_ik_conflict_curves(
     rigify_rig,
     start_frame,
     end_frame,
+    profile_id=None,
 ):
-    """Remove stale limb FK/tweak data when explicitly authoring in IK."""
+    """Remove stale limb FK/tweak data when explicitly authoring in IK.
+
+    Mixamo stays on FK limbs, so nothing is cleared for that profile.
+    """
+    if profile_id == 'MIXAMO':
+        return 0
     removed_count = 0
     for pose_bone in rigify_rig.pose.bones:
         if _is_limb_fk_or_tweak_control(pose_bone.name):
@@ -1489,8 +1524,16 @@ def _remove_finger_control_curves(
     return removed_count
 
 
-def _key_ik_mode(action, rigify_rig, start_frame, end_frame):
-    """Keep the baked action in IK after the live preview state is restored."""
+def _key_ik_mode(action, rigify_rig, start_frame, end_frame, profile_id=None):
+    """Keep the baked action in the correct IK/FK mix after preview restore.
+
+    Mixamo always stays in FK (1.0) for all limbs.
+    """
+    if profile_id == 'MIXAMO':
+        value = 1.0
+    else:
+        value = 0.0
+
     for pose_bone in rigify_rig.pose.bones:
         if not isinstance(pose_bone.get(IK_FK_PROPERTY), float):
             continue
@@ -1504,7 +1547,7 @@ def _key_ik_mode(action, rigify_rig, start_frame, end_frame):
                 if start_frame <= keyframe.co[0] <= end_frame:
                     fcurve.keyframe_points.remove(keyframe)
 
-        pose_bone[IK_FK_PROPERTY] = 0.0
+        pose_bone[IK_FK_PROPERTY] = value
         pose_bone.keyframe_insert(
             data_path=data_path,
             frame=start_frame,
@@ -1605,7 +1648,7 @@ def add_constraints(scene):
         if not scene.udr_saved_ikfk_state:
             scene.udr_saved_ikfk_state = json.dumps(
                 _save_ikfk_state(rigify_rig))
-        _set_drive_mode(rigify_rig, scene.udr_ik_driven)
+        _set_drive_mode(rigify_rig, scene.udr_ik_driven, scene.udr_profile)
         _suspend_target_action_for_preview(scene, rigify_rig)
         _clear_existing_constraints(rigify_rig)
         _clear_offset_helpers()
@@ -1711,7 +1754,7 @@ def bake_to_rigify(scene):
         if scene.udr_keyframe_step > 1:
             _bake_boundary_frames(start_frame, end_frame)
 
-        if scene.udr_torso_controls:
+        if scene.udr_torso_controls and scene.udr_profile != 'MIXAMO':
             removed_curve_count += _remove_torso_conflict_curves(
                 target_action,
                 rigify_rig,
@@ -1733,12 +1776,14 @@ def bake_to_rigify(scene):
                 rigify_rig,
                 start_frame,
                 end_frame,
+                scene.udr_profile,
             )
             _key_ik_mode(
                 target_action,
                 rigify_rig,
                 start_frame,
                 end_frame,
+                scene.udr_profile,
             )
 
         if scene.udr_clean_bake:

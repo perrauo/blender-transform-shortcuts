@@ -1,3972 +1,2128 @@
-import bpy
-from bpy.types import Panel, Operator, PropertyGroup
-from bpy.props import FloatVectorProperty, BoolProperty, FloatProperty, EnumProperty, IntProperty
-from bpy.app.handlers import persistent
 import json
 import math
-import difflib
-from collections import defaultdict
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Reliable transform detection
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _is_transform_running():
-    for window in bpy.context.window_manager.windows:
-        for op in window.modal_operators:
-            if op.bl_idname.startswith("TRANSFORM_OT"):
-                return True
-    return False
-
-
-_was_transforming = False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Core logic (shared / Live Offset)
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _iter_channels(bone):
-    name = bone.name
-
-    path = f'pose.bones["{name}"].location'
-    for i, v in enumerate(bone.location):
-        yield path, i, v
-
-    if bone.rotation_mode == 'QUATERNION':
-        path = f'pose.bones["{name}"].rotation_quaternion'
-        q = bone.rotation_quaternion
-        for i, v in enumerate((q.w, q.x, q.y, q.z)):
-            yield path, i, v
-    elif bone.rotation_mode == 'AXIS_ANGLE':
-        path = f'pose.bones["{name}"].rotation_axis_angle'
-        for i, v in enumerate(bone.rotation_axis_angle):
-            yield path, i, v
-    else:
-        path = f'pose.bones["{name}"].rotation_euler'
-        for i, v in enumerate(bone.rotation_euler):
-            yield path, i, v
-
-    path = f'pose.bones["{name}"].scale'
-    for i, v in enumerate(bone.scale):
-        yield path, i, v
-
-
-def _get_action_fcurves(action, obj):
-    fcurves = getattr(action, "fcurves", None)
-    if fcurves is not None:
-        return fcurves
-
-    anim_data = obj.animation_data
-    slot = anim_data.action_slot if anim_data else None
-    if slot is None:
-        return None
-
-    for layer in getattr(action, "layers", []) or []:
-        for strip in getattr(layer, "strips", []) or []:
-            for channelbag in getattr(strip, "channelbags", []) or []:
-                if getattr(channelbag, "slot_handle", None) == slot.handle:
-                    return channelbag.fcurves
-    return None
-
-
-def _iter_all_fcurves(action):
-    """Yield every F-Curve in an Action (legacy or slotted/layered)."""
-    legacy = getattr(action, "fcurves", None)
-    if legacy is not None:
-        try:
-            for fc in legacy:
-                yield fc
-            return
-        except (TypeError, AttributeError):
-            pass
-
-    for layer in getattr(action, "layers", []) or []:
-        for strip in getattr(layer, "strips", []) or []:
-            bags = getattr(strip, "channelbags", None)
-            if bags:
-                for bag in bags:
-                    yield from bag.fcurves
-                continue
-            # Fallback: try per-slot channelbag lookup
-            for slot in getattr(action, "slots", []) or []:
-                try:
-                    bag = strip.channelbag(slot)
-                except Exception:
-                    bag = None
-                if bag is not None:
-                    yield from bag.fcurves
-
-
-def _ensure_fcurve(action, obj, data_path, array_index):
-    """
-    Find or create an F-Curve on *action* for the given path/index,
-    associated with *obj* (needed for slotted actions).
-    Returns the F-Curve or None on failure.
-    """
-    # Modern Blender 4.4+ / 5.x convenience
-    ensure = getattr(action, "fcurve_ensure_for_datablock", None)
-    if ensure is not None and obj is not None:
-        try:
-            return ensure(datablock=obj, data_path=data_path, index=array_index)
-        except Exception:
-            pass
-
-    # Legacy path
-    fcurves = getattr(action, "fcurves", None)
-    if fcurves is not None:
-        fc = fcurves.find(data_path, index=array_index)
-        if fc is not None:
-            return fc
-        try:
-            return fcurves.new(data_path, index=array_index)
-        except Exception:
-            return None
-
-    # Slotted / layered fallback using bpy_extras if available
-    try:
-        from bpy_extras import anim_utils
-        anim_data = obj.animation_data if obj else None
-        slot = getattr(anim_data, "action_slot", None) if anim_data else None
-        if slot is None and hasattr(action, "slots") and len(action.slots):
-            # Prefer a slot that matches the object, else first
-            for s in action.slots:
-                if getattr(s, "target_id_type", None) in ('OBJECT', 'NONE', 0):
-                    slot = s
-                    break
-            if slot is None:
-                slot = action.slots[0]
-        if slot is not None:
-            bag = anim_utils.action_ensure_channelbag_for_slot(action, slot)
-            if bag is not None:
-                fc = bag.fcurves.find(data_path, index=array_index)
-                if fc is not None:
-                    return fc
-                return bag.fcurves.new(data_path, index=array_index)
-    except Exception:
-        pass
-
-    return None
-
-
-def _copy_fcurve_keyframes(src_fc, tgt_fc):
-    """Copy keyframes from src_fc into tgt_fc, preserving any target keys
-    that lie outside the source curve's frame range.
-
-    Keys whose frame falls inside [src_min, src_max] are removed and
-    replaced by the corresponding source keys. Keys completely outside
-    that range are left untouched.
-    """
-    if not src_fc.keyframe_points:
-        return
-
-    # Determine the frame span of the source curve
-    src_frames = [kp.co.x for kp in src_fc.keyframe_points]
-    src_min = min(src_frames)
-    src_max = max(src_frames)
-
-    # Remove target keys that fall inside the source range (inclusive)
-    # Walk backwards so indices stay valid while removing
-    for i in range(len(tgt_fc.keyframe_points) - 1, -1, -1):
-        t = tgt_fc.keyframe_points[i].co.x
-        if src_min - 1e-6 <= t <= src_max + 1e-6:
-            tgt_fc.keyframe_points.remove(tgt_fc.keyframe_points[i])
-
-    # Insert a full copy of every source keyframe
-    for src_kp in src_fc.keyframe_points:
-        new_kp = tgt_fc.keyframe_points.insert(
-            src_kp.co.x, src_kp.co.y, options={'FAST'}
-        )
-        # Copy handles
-        new_kp.handle_left = src_kp.handle_left.copy()
-        new_kp.handle_right = src_kp.handle_right.copy()
-        # Copy remaining attributes that affect evaluation
-        for attr in (
-            "interpolation", "easing", "type",
-            "back", "amplitude", "period",
-            "handle_left_type", "handle_right_type",
-        ):
-            if hasattr(src_kp, attr) and hasattr(new_kp, attr):
-                try:
-                    setattr(new_kp, attr, getattr(src_kp, attr))
-                except Exception:
-                    pass
-
-    # Copy a few useful F-Curve level settings
-    for attr in ("extrapolation", "color_mode", "auto_smoothing"):
-        if hasattr(src_fc, attr) and hasattr(tgt_fc, attr):
-            try:
-                setattr(tgt_fc, attr, getattr(src_fc, attr))
-            except Exception:
-                pass
-
-    tgt_fc.update()
-
-
-def collect_offsets(context):
-    obj = context.active_object
-    if not obj or obj.type != 'ARMATURE' or obj.mode != 'POSE':
-        return []
-    if not obj.animation_data or not obj.animation_data.action:
-        return []
-
-    action = obj.animation_data.action
-    fcurves = _get_action_fcurves(action, obj)
-    if fcurves is None:
-        return []
-
-    selected = context.selected_pose_bones or []
-    if not selected:
-        return []
-
-    current_frame = float(context.scene.frame_current)
-    pending = []
-
-    for bone in selected:
-        for data_path, array_index, live_val in _iter_channels(bone):
-            fc = fcurves.find(data_path, index=array_index)
-            if fc is None or fc.lock or fc.mute:
-                continue
-
-            offset = live_val - fc.evaluate(current_frame)
-            if abs(offset) < 1e-9:
-                continue
-
-            pending.append((fc, offset, live_val, data_path, array_index, bone.name))
-
-    return pending
-
-
-def apply_offsets(pending, selected_only=False):
-    """Shift keyframe values (and handles) by the given offsets.
-
-    If selected_only is True, only keyframes whose control point is selected
-    are modified. Otherwise every keyframe on the channel is shifted.
-    """
-    for fc, offset, *_ in pending:
-        changed = False
-        for kp in fc.keyframe_points:
-            if selected_only and not kp.select_control_point:
-                continue
-            kp.co.y += offset
-            kp.handle_left.y += offset
-            kp.handle_right.y += offset
-            changed = True
-        if changed:
-            fc.update()
-
-
-def apply_relative_offsets(pending, selected_only=False):
-    """Drive every (selected) keyframe to the current live value.
-
-    For a key at time t the per-key offset is live − keyed@t
-    (i.e. relative to that key's own value, not to the playhead).
-    Keys that already sit on the playhead therefore receive the full
-    absolute offset; all other keys are brought to the live pose.
-    Handle shape relative to each control point is preserved.
-    """
-    for fc, _offset, live_val, *_ in pending:
-        changed = False
-        for kp in fc.keyframe_points:
-            if selected_only and not kp.select_control_point:
-                continue
-            dy = live_val - kp.co.y
-            if abs(dy) < 1e-12:
-                continue
-            kp.co.y += dy
-            kp.handle_left.y += dy
-            kp.handle_right.y += dy
-            changed = True
-        if changed:
-            fc.update()
-
-
-def get_keyed_value(action, obj, data_path, array_index, frame):
-    fcurves = _get_action_fcurves(action, obj)
-    if fcurves is None:
-        return None
-    fc = fcurves.find(data_path, index=array_index)
-    if fc is None:
-        return None
-    return fc.evaluate(frame)
-
-
-def _apply_axis_mirrors(settings, values, is_rotation=False, rotation_mode='XYZ'):
-    """Apply X/Y/Z mirror toggles to a location, rotation or scale vector.
-
-    For location / scale / Euler: simply negate the selected components.
-    For Quaternion / Axis-Angle: apply the standard reflection formulas
-    that preserve a valid orientation after mirroring across an axis.
-    """
-    if not (settings.mirror_x or settings.mirror_y or settings.mirror_z):
-        return values
-
-    vals = list(values)
-
-    if is_rotation and rotation_mode == 'QUATERNION':
-        # vals = [w, x, y, z]
-        if settings.mirror_x:
-            vals[2] = -vals[2]
-            vals[3] = -vals[3]
-        if settings.mirror_y:
-            vals[1] = -vals[1]
-            vals[3] = -vals[3]
-        if settings.mirror_z:
-            vals[1] = -vals[1]
-            vals[2] = -vals[2]
-    elif is_rotation and rotation_mode == 'AXIS_ANGLE':
-        # vals = [angle, x, y, z] – mirror the axis vector the same way
-        if settings.mirror_x:
-            vals[2] = -vals[2]
-            vals[3] = -vals[3]
-        if settings.mirror_y:
-            vals[1] = -vals[1]
-            vals[3] = -vals[3]
-        if settings.mirror_z:
-            vals[1] = -vals[1]
-            vals[2] = -vals[2]
-    else:
-        # Location, Scale or Euler – component-wise negation
-        if settings.mirror_x and len(vals) > 0:
-            vals[0] = -vals[0]
-        if settings.mirror_y and len(vals) > 1:
-            vals[1] = -vals[1]
-        if settings.mirror_z and len(vals) > 2:
-            vals[2] = -vals[2]
-
-    return vals
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Multi-bone name matching helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _bone_name_similarity(name_a, name_b):
-    """Return a similarity ratio between two bone names (0.0 – 1.0)."""
-    return difflib.SequenceMatcher(None, name_a.lower(), name_b.lower()).ratio()
-
-
-def _find_best_bone_match(target_name, source_names, threshold=0.45):
-    """Return the source name with the highest similarity to target_name,
-    or None if no source exceeds the threshold.
-    """
-    best_name = None
-    best_score = threshold
-    for src in source_names:
-        score = _bone_name_similarity(target_name, src)
-        if score > best_score:
-            best_score = score
-            best_name = src
-    return best_name
-
-
-def _compute_offsets_for_bone(bone, obj, action, frame):
-    """Return (loc_offset, rot_offset, scale_offset) for a single bone."""
-    name = bone.name
-
-    loc = [0.0, 0.0, 0.0]
-    for i in range(3):
-        keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].location', i, frame)
-        loc[i] = (bone.location[i] - keyed) if keyed is not None else bone.location[i]
-
-    rot = [0.0, 0.0, 0.0, 0.0]
-    if bone.rotation_mode == 'QUATERNION':
-        q = bone.rotation_quaternion
-        for i, v in enumerate((q.w, q.x, q.y, q.z)):
-            keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].rotation_quaternion', i, frame)
-            rot[i] = (v - keyed) if keyed is not None else v
-    elif bone.rotation_mode == 'AXIS_ANGLE':
-        for i, v in enumerate(bone.rotation_axis_angle):
-            keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].rotation_axis_angle', i, frame)
-            rot[i] = (v - keyed) if keyed is not None else v
-    else:
-        for i, v in enumerate(bone.rotation_euler):
-            keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].rotation_euler', i, frame)
-            rot[i] = (v - keyed) if keyed is not None else v
-
-    scale = [0.0, 0.0, 0.0]
-    for i in range(3):
-        keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].scale', i, frame)
-        scale[i] = (bone.scale[i] - keyed) if keyed is not None else bone.scale[i]
-
-    return loc, rot, scale
-
-
-def _apply_offset_to_bone(bone, obj, action, frame, loc_off, rot_off, scale_off):
-    """Apply location / rotation / scale offsets directly to a pose bone."""
-    name = bone.name
-
-    for i in range(3):
-        keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].location', i, frame)
-        bone.location[i] = (keyed + loc_off[i]) if keyed is not None else loc_off[i]
-
-    if bone.rotation_mode == 'QUATERNION':
-        path = f'pose.bones["{name}"].rotation_quaternion'
-        for i in range(4):
-            keyed = get_keyed_value(action, obj, path, i, frame)
-            bone.rotation_quaternion[i] = (keyed + rot_off[i]) if keyed is not None else rot_off[i]
-    elif bone.rotation_mode == 'AXIS_ANGLE':
-        path = f'pose.bones["{name}"].rotation_axis_angle'
-        for i in range(4):
-            keyed = get_keyed_value(action, obj, path, i, frame)
-            bone.rotation_axis_angle[i] = (keyed + rot_off[i]) if keyed is not None else rot_off[i]
-    else:
-        path = f'pose.bones["{name}"].rotation_euler'
-        for i in range(3):
-            keyed = get_keyed_value(action, obj, path, i, frame)
-            bone.rotation_euler[i] = (keyed + rot_off[i]) if keyed is not None else rot_off[i]
-
-    for i in range(3):
-        keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].scale', i, frame)
-        bone.scale[i] = (keyed + scale_off[i]) if keyed is not None else scale_off[i]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Live Offset PropertyGroup
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _update_loc(self, context):
-    if self.suppress_update or _is_transform_running():
-        return
-    bone = context.active_pose_bone
-    if not bone:
-        return
-    obj = context.active_object
-    if not obj or not obj.animation_data or not obj.animation_data.action:
-        return
-    action = obj.animation_data.action
-    frame = context.scene.frame_current
-    name = bone.name
-
-    for i in range(3):
-        keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].location', i, frame)
-        bone.location[i] = (keyed + self.loc_offset[i]) if keyed is not None else self.loc_offset[i]
-
-
-def _update_rot(self, context):
-    if self.suppress_update or _is_transform_running():
-        return
-    bone = context.active_pose_bone
-    if not bone:
-        return
-    obj = context.active_object
-    if not obj or not obj.animation_data or not obj.animation_data.action:
-        return
-    action = obj.animation_data.action
-    frame = context.scene.frame_current
-    name = bone.name
-
-    if bone.rotation_mode == 'QUATERNION':
-        path = f'pose.bones["{name}"].rotation_quaternion'
-        for i in range(4):
-            keyed = get_keyed_value(action, obj, path, i, frame)
-            bone.rotation_quaternion[i] = (keyed + self.rot_offset[i]) if keyed is not None else self.rot_offset[i]
-    elif bone.rotation_mode == 'AXIS_ANGLE':
-        path = f'pose.bones["{name}"].rotation_axis_angle'
-        for i in range(4):
-            keyed = get_keyed_value(action, obj, path, i, frame)
-            bone.rotation_axis_angle[i] = (keyed + self.rot_offset[i]) if keyed is not None else self.rot_offset[i]
-    else:
-        path = f'pose.bones["{name}"].rotation_euler'
-        for i in range(3):
-            keyed = get_keyed_value(action, obj, path, i, frame)
-            bone.rotation_euler[i] = (keyed + self.rot_offset[i]) if keyed is not None else self.rot_offset[i]
-
-
-def _update_scale(self, context):
-    if self.suppress_update or _is_transform_running():
-        return
-    bone = context.active_pose_bone
-    if not bone:
-        return
-    obj = context.active_object
-    if not obj or not obj.animation_data or not obj.animation_data.action:
-        return
-    action = obj.animation_data.action
-    frame = context.scene.frame_current
-    name = bone.name
-
-    for i in range(3):
-        keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].scale', i, frame)
-        bone.scale[i] = (keyed + self.scale_offset[i]) if keyed is not None else self.scale_offset[i]
-
-
-class LIVEOFFSET_PG_settings(PropertyGroup):
-    suppress_update: BoolProperty(default=False)
-
-    loc_offset: FloatVectorProperty(
-        name="Location Offset",
-        size=3,
-        subtype='TRANSLATION',
-        precision=5,
-        update=_update_loc,
-    )
-    rot_offset: FloatVectorProperty(
-        name="Rotation Offset",
-        size=4,
-        precision=5,
-        update=_update_rot,
-    )
-    scale_offset: FloatVectorProperty(
-        name="Scale Offset",
-        size=3,
-        subtype='XYZ',
-        precision=5,
-        update=_update_scale,
-    )
-
-    # Mirror toggles used when pasting offsets from the clipboard
-    mirror_x: BoolProperty(
-        name="Mirror X",
-        description="Negate / reflect the X component when pasting a live offset",
-        default=False,
-    )
-    mirror_y: BoolProperty(
-        name="Mirror Y",
-        description="Negate / reflect the Y component when pasting a live offset",
-        default=False,
-    )
-    mirror_z: BoolProperty(
-        name="Mirror Z",
-        description="Negate / reflect the Z component when pasting a live offset",
-        default=False,
-    )
-
-
-def sync_offsets_from_bone(context):
-    if _is_transform_running():
-        return
-
-    wm = context.window_manager
-    settings = wm.live_offset_settings
-    bone = context.active_pose_bone
-    obj = context.active_object
-
-    if not bone or not obj or not obj.animation_data or not obj.animation_data.action:
-        return
-
-    action = obj.animation_data.action
-    frame = float(context.scene.frame_current)
-    name = bone.name
-
-    settings.suppress_update = True
-
-    for i in range(3):
-        keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].location', i, frame)
-        settings.loc_offset[i] = (bone.location[i] - keyed) if keyed is not None else bone.location[i]
-
-    if bone.rotation_mode == 'QUATERNION':
-        q = bone.rotation_quaternion
-        for i, v in enumerate((q.w, q.x, q.y, q.z)):
-            keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].rotation_quaternion', i, frame)
-            settings.rot_offset[i] = (v - keyed) if keyed is not None else v
-    elif bone.rotation_mode == 'AXIS_ANGLE':
-        for i, v in enumerate(bone.rotation_axis_angle):
-            keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].rotation_axis_angle', i, frame)
-            settings.rot_offset[i] = (v - keyed) if keyed is not None else v
-    else:
-        for i, v in enumerate(bone.rotation_euler):
-            keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].rotation_euler', i, frame)
-            settings.rot_offset[i] = (v - keyed) if keyed is not None else v
-        settings.rot_offset[3] = 0.0
-
-    for i in range(3):
-        keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].scale', i, frame)
-        settings.scale_offset[i] = (bone.scale[i] - keyed) if keyed is not None else bone.scale[i]
-
-    settings.suppress_update = False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Transform Shortcuts PropertyGroup
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _update_ts_loc(self, context):
-    if self.suppress_update or _is_transform_running():
-        return
-    bone = context.active_pose_bone
-    if not bone:
-        return
-    bone.location = self.location[:]
-
-
-def _update_ts_rot(self, context):
-    if self.suppress_update or _is_transform_running():
-        return
-    bone = context.active_pose_bone
-    if not bone:
-        return
-
-    if bone.rotation_mode == 'QUATERNION':
-        bone.rotation_quaternion = self.rotation[:]
-    elif bone.rotation_mode == 'AXIS_ANGLE':
-        bone.rotation_axis_angle = self.rotation[:]
-    else:
-        bone.rotation_euler = self.rotation[:3]
-
-
-def _update_ts_scale(self, context):
-    if self.suppress_update or _is_transform_running():
-        return
-    bone = context.active_pose_bone
-    if not bone:
-        return
-    bone.scale = self.scale[:]
-
-
-class TRANSFORMSHORTCUTS_PG_settings(PropertyGroup):
-    suppress_update: BoolProperty(default=False)
-
-    location: FloatVectorProperty(
-        name="Location",
-        size=3,
-        subtype='TRANSLATION',
-        precision=5,
-        update=_update_ts_loc,
-    )
-    rotation: FloatVectorProperty(
-        name="Rotation",
-        size=4,
-        precision=5,
-        update=_update_ts_rot,
-    )
-    scale: FloatVectorProperty(
-        name="Scale",
-        size=3,
-        subtype='XYZ',
-        default=(1.0, 1.0, 1.0),
-        precision=5,
-        update=_update_ts_scale,
-    )
-
-
-def sync_transforms_from_bone(context):
-    if _is_transform_running():
-        return
-
-    wm = context.window_manager
-    settings = wm.transform_shortcuts_settings
-    bone = context.active_pose_bone
-
-    if not bone:
-        return
-
-    settings.suppress_update = True
-
-    settings.location = bone.location[:]
-
-    if bone.rotation_mode == 'QUATERNION':
-        q = bone.rotation_quaternion
-        settings.rotation = (q.w, q.x, q.y, q.z)
-    elif bone.rotation_mode == 'AXIS_ANGLE':
-        settings.rotation = bone.rotation_axis_angle[:]
-    else:
-        settings.rotation = (*bone.rotation_euler[:], 0.0)
-
-    settings.scale = bone.scale[:]
-
-    settings.suppress_update = False
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Anim Shortcuts PropertyGroup
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _action_enum_items(self, context):
-    """Dynamic list of all Actions in the blend file for the target dropdown."""
-    items = [("NONE", "(Select Target Action)", "No target action selected")]
-    for action in sorted(bpy.data.actions, key=lambda a: a.name.lower()):
-        items.append((action.name, action.name, f"Copy keyframes into '{action.name}'"))
-    return items
-
-
-class ANIMSHORTCUTS_PG_settings(PropertyGroup):
-    loop_tolerance: FloatProperty(
-        name="Loop Tolerance",
-        description="Maximum allowed difference per channel when matching poses",
-        default=0.05,
-        min=1e-7,
-        max=1.0,
-        soft_min=0.001,
-        soft_max=0.3,
-        precision=4,
-        step=0.01,
-    )
-
-    prefer_period: IntProperty(
-        name="Prefer Period Length",
-        description="Preferred cycle length in frames. Detection will strongly prefer periods close to this value. "
-                    "Set to roughly half the action length for animations that contain two walk cycles",
-        default=30,
-        min=4,
-        max=500,
-    )
-
-    ignore_root_location: BoolProperty(
-        name="Ignore Root Location",
-        description="Ignore location channels of root bones (hips / pelvis / root). Essential for walk cycles",
-        default=True,
-    )
-
-    compare_mode: EnumProperty(
-        name="Compare",
-        description="Which channels to use when detecting a loop",
-        items=[
-            ('ROT_SCALE', "Rotation + Scale", "Ignore all location channels (best for locomotion)"),
-            ('ALL_EXCEPT_ROOT_LOC', "All except Root Loc", "Use everything except root bone location"),
-            ('ALL', "Everything", "Strict: every channel of every bone must match"),
-        ],
-        default='ROT_SCALE',
-    )
-
-    target_action: EnumProperty(
-        name="Target Action",
-        description="Action that will receive the keyframes of the currently selected bones",
-        items=_action_enum_items,
-    )
-
-    homogenize_target_action: EnumProperty(
-        name="Homogenize Target Action",
-        description="Target Action whose quaternion rotations will be aligned to the active (source) Action's dominant orientation",
-        items=_action_enum_items,
-    )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Safe refresh
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _tag_ui_redraw():
-    for window in bpy.context.window_manager.windows:
-        for area in window.screen.areas:
-            if area.type == 'VIEW_3D':
-                for region in area.regions:
-                    if region.type == 'UI':
-                        region.tag_redraw()
-
-
-@persistent
-def _on_depsgraph_update(scene, depsgraph):
-    global _was_transforming
-
-    transforming = _is_transform_running()
-
-    if _was_transforming and not transforming:
-        try:
-            sync_offsets_from_bone(bpy.context)
-            sync_transforms_from_bone(bpy.context)
-            _tag_ui_redraw()
-        except Exception:
-            pass
-
-    _was_transforming = transforming
-
-    if transforming:
-        return
-
-    obj = bpy.context.active_object
-    if not obj or obj.type != 'ARMATURE' or obj.mode != 'POSE':
-        return
-
-    try:
-        wm = bpy.context.window_manager
-        bone = bpy.context.active_pose_bone
-        frame = scene.frame_current
-
-        fingerprint = (bone.name if bone else "", frame)
-        last = getattr(wm, "_ts_last_fingerprint", None)
-        if fingerprint != last:
-            wm._ts_last_fingerprint = fingerprint
-            sync_offsets_from_bone(bpy.context)
-            sync_transforms_from_bone(bpy.context)
-            _tag_ui_redraw()
-    except Exception:
-        pass
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Live Offset Operators
-# ─────────────────────────────────────────────────────────────────────────────
-
-class LIVEOFFSET_OT_apply(Operator):
-    bl_idname = "liveoffset.apply"
-    bl_label = "Apply to All Keyframes"
-    bl_description = "Shift every keyframe on the affected channels by the current live offset"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        pending = collect_offsets(context)
-        if not pending:
-            self.report({'INFO'}, "Nothing to do – all offsets are zero")
-            return {'CANCELLED'}
-
-        bpy.ops.ed.undo_push(message="Live Transform Offset (All)")
-        apply_offsets(pending, selected_only=False)
-        context.scene.frame_set(context.scene.frame_current)
-        sync_offsets_from_bone(context)
-
-        bones = {p[5] for p in pending}
-        self.report({'INFO'}, f"Shifted {len(pending)} channel(s) across {len(bones)} bone(s) (all keyframes)")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and context.selected_pose_bones and not _is_transform_running()
-        )
-
-
-class LIVEOFFSET_OT_apply_selected(Operator):
-    bl_idname = "liveoffset.apply_selected"
-    bl_label = "Apply to Selected Keyframes"
-    bl_description = "Shift only the currently selected keyframes on the affected channels by the current live offset"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        pending = collect_offsets(context)
-        if not pending:
-            self.report({'INFO'}, "Nothing to do – all offsets are zero")
-            return {'CANCELLED'}
-
-        # Count how many selected keyframes will actually be touched
-        selected_count = 0
-        for fc, offset, *_ in pending:
-            for kp in fc.keyframe_points:
-                if kp.select_control_point:
-                    selected_count += 1
-
-        if selected_count == 0:
-            self.report({'WARNING'}, "No selected keyframes found on the offset channels")
-            return {'CANCELLED'}
-
-        bpy.ops.ed.undo_push(message="Live Transform Offset (Selected)")
-        apply_offsets(pending, selected_only=True)
-        context.scene.frame_set(context.scene.frame_current)
-        sync_offsets_from_bone(context)
-
-        bones = {p[5] for p in pending}
-        self.report(
-            {'INFO'},
-            f"Shifted {selected_count} selected keyframe(s) across {len(pending)} channel(s) / {len(bones)} bone(s)"
-        )
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and context.selected_pose_bones and not _is_transform_running()
-        )
-
-
-class LIVEOFFSET_OT_apply_relative(Operator):
-    bl_idname = "liveoffset.apply_relative"
-    bl_label = "Apply Relative Offset to All"
-    bl_description = (
-        "Drive every keyframe on the affected channels to the current live pose value. "
-        "Keys on the playhead receive the full offset; keys at other times receive an "
-        "offset relative to their own keyed value (live − keyed@t). Handle shape is preserved."
-    )
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        pending = collect_offsets(context)
-        if not pending:
-            self.report({'INFO'}, "Nothing to do – all offsets are zero")
-            return {'CANCELLED'}
-
-        bpy.ops.ed.undo_push(message="Live Relative Offset (All)")
-        apply_relative_offsets(pending, selected_only=False)
-        context.scene.frame_set(context.scene.frame_current)
-        sync_offsets_from_bone(context)
-
-        bones = {p[5] for p in pending}
-        self.report(
-            {'INFO'},
-            f"Relative-offset applied to {len(pending)} channel(s) across {len(bones)} bone(s) (all keyframes)"
-        )
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and context.selected_pose_bones and not _is_transform_running()
-        )
-
-
-class LIVEOFFSET_OT_apply_relative_selected(Operator):
-    bl_idname = "liveoffset.apply_relative_selected"
-    bl_label = "Apply Relative Offset to Selected"
-    bl_description = (
-        "Drive only the currently selected keyframes to the current live pose value. "
-        "Keys on the playhead receive the full offset; other selected keys receive an "
-        "offset relative to their own keyed value (live − keyed@t). Handle shape is preserved."
-    )
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        pending = collect_offsets(context)
-        if not pending:
-            self.report({'INFO'}, "Nothing to do – all offsets are zero")
-            return {'CANCELLED'}
-
-        selected_count = 0
-        for fc, *_ in pending:
-            for kp in fc.keyframe_points:
-                if kp.select_control_point:
-                    selected_count += 1
-
-        if selected_count == 0:
-            self.report({'WARNING'}, "No selected keyframes found on the offset channels")
-            return {'CANCELLED'}
-
-        bpy.ops.ed.undo_push(message="Live Relative Offset (Selected)")
-        apply_relative_offsets(pending, selected_only=True)
-        context.scene.frame_set(context.scene.frame_current)
-        sync_offsets_from_bone(context)
-
-        bones = {p[5] for p in pending}
-        self.report(
-            {'INFO'},
-            f"Relative-offset applied to {selected_count} selected keyframe(s) "
-            f"across {len(pending)} channel(s) / {len(bones)} bone(s)"
-        )
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and context.selected_pose_bones and not _is_transform_running()
-        )
-
-
-class LIVEOFFSET_OT_refresh(Operator):
-    bl_idname = "liveoffset.refresh"
-    bl_label = "Refresh Offsets"
-    bl_options = {'INTERNAL'}
-
-    def execute(self, context):
-        if not _is_transform_running():
-            sync_offsets_from_bone(context)
-        return {'FINISHED'}
-
-
-class LIVEOFFSET_OT_reset(Operator):
-    bl_idname = "liveoffset.reset"
-    bl_label = "Reset Offsets"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.live_offset_settings
-        settings.suppress_update = True
-        settings.loc_offset = (0.0, 0.0, 0.0)
-        settings.rot_offset = (0.0, 0.0, 0.0, 0.0)
-        settings.scale_offset = (0.0, 0.0, 0.0)
-        settings.suppress_update = False
-
-        _update_loc(settings, context)
-        _update_rot(settings, context)
-        _update_scale(settings, context)
-
-        self.report({'INFO'}, "Offsets reset to zero")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class LIVEOFFSET_OT_copy(Operator):
-    bl_idname = "liveoffset.copy"
-    bl_label = "Copy Offsets"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        frame = float(context.scene.frame_current)
-        selected = context.selected_pose_bones or []
-
-        if not selected:
-            self.report({'WARNING'}, "No bones selected")
-            return {'CANCELLED'}
-
-        bones_data = {}
-        for bone in selected:
-            loc, rot, scale = _compute_offsets_for_bone(bone, obj, action, frame)
-            bones_data[bone.name] = {
-                "loc": loc,
-                "rot": rot,
-                "scale": scale,
-            }
-
-        data = {
-            "live_offset": True,
-            "bones": bones_data,
-        }
-
-        # Keep old flat format when only one bone is selected (backward compatible)
-        if len(selected) == 1:
-            name = selected[0].name
-            data["loc"] = bones_data[name]["loc"]
-            data["rot"] = bones_data[name]["rot"]
-            data["scale"] = bones_data[name]["scale"]
-
-        try:
-            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
-            if len(selected) == 1:
-                self.report({'INFO'}, "Offsets copied to clipboard")
-            else:
-                self.report({'INFO'}, f"Offsets for {len(selected)} bones copied to clipboard")
-        except Exception as e:
-            self.report({'ERROR'}, f"Copy failed: {e}")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == 'ARMATURE' and obj.mode == 'POSE' and not _is_transform_running()
-
-
-class LIVEOFFSET_OT_paste(Operator):
-    bl_idname = "liveoffset.paste"
-    bl_label = "Paste Offsets"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        clipboard = context.window_manager.clipboard.strip()
-        if not clipboard:
-            self.report({'WARNING'}, "Clipboard is empty")
-            return {'CANCELLED'}
-
-        try:
-            data = json.loads(clipboard)
-        except json.JSONDecodeError:
-            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
-            return {'CANCELLED'}
-
-        if not isinstance(data, dict) or not data.get("live_offset"):
-            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.live_offset_settings
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        frame = float(context.scene.frame_current)
-
-        # ── Multi-bone paste (only when more than one bone was copied) ──────
-        bones_data = data.get("bones")
-        if isinstance(bones_data, dict) and len(bones_data) > 1:
-            selected = context.selected_pose_bones or []
-            if not selected:
-                self.report({'WARNING'}, "Select target bones to paste multi-bone offsets")
-                return {'CANCELLED'}
-
-            source_names = list(bones_data.keys())
-            matched = 0
-            skipped = 0
-
-            for bone in selected:
-                best = _find_best_bone_match(bone.name, source_names)
-                if best is None:
-                    skipped += 1
-                    continue
-
-                src = bones_data[best]
-                loc = _apply_axis_mirrors(settings, src.get("loc", [0, 0, 0]))
-                rot = _apply_axis_mirrors(
-                    settings, src.get("rot", [0, 0, 0, 0]),
-                    is_rotation=True, rotation_mode=bone.rotation_mode
-                )
-                scale = _apply_axis_mirrors(settings, src.get("scale", [0, 0, 0]))
-
-                _apply_offset_to_bone(bone, obj, action, frame, loc, rot, scale)
-                matched += 1
-
-            sync_offsets_from_bone(context)
-
-            msg = f"Pasted offsets to {matched} bone(s) via name matching"
-            if skipped:
-                msg += f" ({skipped} unmatched)"
-            self.report({'INFO'}, msg)
-            return {'FINISHED'}
-
-        # ── Single-bone / legacy paste ──────────────────────────────────────
-        bone = context.active_pose_bone
-        if not bone:
-            self.report({'WARNING'}, "No active pose bone")
-            return {'CANCELLED'}
-
-        rot_mode = bone.rotation_mode
-
-        # Prefer explicit bones dict with a single entry, fall back to flat keys
-        if isinstance(bones_data, dict) and len(bones_data) == 1:
-            src = next(iter(bones_data.values()))
-            loc_src = src.get("loc")
-            rot_src = src.get("rot")
-            scale_src = src.get("scale")
-        else:
-            loc_src = data.get("loc")
-            rot_src = data.get("rot")
-            scale_src = data.get("scale")
-
-        settings.suppress_update = True
-        try:
-            if loc_src and len(loc_src) == 3:
-                settings.loc_offset = _apply_axis_mirrors(settings, loc_src)
-            if rot_src and len(rot_src) == 4:
-                settings.rot_offset = _apply_axis_mirrors(
-                    settings, rot_src, is_rotation=True, rotation_mode=rot_mode
-                )
-            if scale_src and len(scale_src) == 3:
-                settings.scale_offset = _apply_axis_mirrors(settings, scale_src)
-        except Exception as e:
-            settings.suppress_update = False
-            self.report({'ERROR'}, f"Paste failed: {e}")
-            return {'CANCELLED'}
-
-        settings.suppress_update = False
-        _update_loc(settings, context)
-        _update_rot(settings, context)
-        _update_scale(settings, context)
-
-        self.report({'INFO'}, "Offsets pasted from clipboard")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-# Individual Live Offset Copy / Paste operators
-
-class LIVEOFFSET_OT_copy_location(Operator):
-    bl_idname = "liveoffset.copy_location"
-    bl_label = "Copy Location Offset"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        frame = float(context.scene.frame_current)
-        selected = context.selected_pose_bones or []
-
-        if not selected:
-            self.report({'WARNING'}, "No bones selected")
-            return {'CANCELLED'}
-
-        bones_data = {}
-        for bone in selected:
-            loc, _, _ = _compute_offsets_for_bone(bone, obj, action, frame)
-            bones_data[bone.name] = {"loc": loc}
-
-        data = {
-            "live_offset": True,
-            "bones": bones_data,
-        }
-        if len(selected) == 1:
-            data["loc"] = bones_data[selected[0].name]["loc"]
-
-        try:
-            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
-            if len(selected) == 1:
-                self.report({'INFO'}, "Location offset copied")
-            else:
-                self.report({'INFO'}, f"Location offsets for {len(selected)} bones copied")
-        except Exception as e:
-            self.report({'ERROR'}, f"Copy failed: {e}")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == 'ARMATURE' and obj.mode == 'POSE' and not _is_transform_running()
-
-
-class LIVEOFFSET_OT_paste_location(Operator):
-    bl_idname = "liveoffset.paste_location"
-    bl_label = "Paste Location Offset"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        clipboard = context.window_manager.clipboard.strip()
-        if not clipboard:
-            self.report({'WARNING'}, "Clipboard is empty")
-            return {'CANCELLED'}
-
-        try:
-            data = json.loads(clipboard)
-        except json.JSONDecodeError:
-            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
-            return {'CANCELLED'}
-
-        if not isinstance(data, dict) or not data.get("live_offset"):
-            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.live_offset_settings
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        frame = float(context.scene.frame_current)
-
-        bones_data = data.get("bones")
-        if isinstance(bones_data, dict) and len(bones_data) > 1:
-            selected = context.selected_pose_bones or []
-            if not selected:
-                self.report({'WARNING'}, "Select target bones to paste multi-bone offsets")
-                return {'CANCELLED'}
-
-            source_names = list(bones_data.keys())
-            matched = 0
-            for bone in selected:
-                best = _find_best_bone_match(bone.name, source_names)
-                if best is None:
-                    continue
-                src = bones_data[best]
-                if "loc" not in src or len(src["loc"]) != 3:
-                    continue
-                loc = _apply_axis_mirrors(settings, src["loc"])
-                name = bone.name
-                for i in range(3):
-                    keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].location', i, frame)
-                    bone.location[i] = (keyed + loc[i]) if keyed is not None else loc[i]
-                matched += 1
-
-            sync_offsets_from_bone(context)
-            self.report({'INFO'}, f"Location offsets pasted to {matched} bone(s)")
-            return {'FINISHED'}
-
-        # Single / legacy
-        if isinstance(bones_data, dict) and len(bones_data) == 1:
-            loc_src = next(iter(bones_data.values())).get("loc")
-        else:
-            loc_src = data.get("loc")
-
-        if not loc_src or len(loc_src) != 3:
-            self.report({'WARNING'}, "Clipboard does not contain a valid Location Offset")
-            return {'CANCELLED'}
-
-        settings.suppress_update = True
-        try:
-            settings.loc_offset = _apply_axis_mirrors(settings, loc_src)
-        except Exception as e:
-            settings.suppress_update = False
-            self.report({'ERROR'}, f"Paste failed: {e}")
-            return {'CANCELLED'}
-
-        settings.suppress_update = False
-        _update_loc(settings, context)
-        self.report({'INFO'}, "Location offset pasted")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class LIVEOFFSET_OT_copy_rotation(Operator):
-    bl_idname = "liveoffset.copy_rotation"
-    bl_label = "Copy Rotation Offset"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        frame = float(context.scene.frame_current)
-        selected = context.selected_pose_bones or []
-
-        if not selected:
-            self.report({'WARNING'}, "No bones selected")
-            return {'CANCELLED'}
-
-        bones_data = {}
-        for bone in selected:
-            _, rot, _ = _compute_offsets_for_bone(bone, obj, action, frame)
-            bones_data[bone.name] = {"rot": rot}
-
-        data = {
-            "live_offset": True,
-            "bones": bones_data,
-        }
-        if len(selected) == 1:
-            data["rot"] = bones_data[selected[0].name]["rot"]
-
-        try:
-            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
-            if len(selected) == 1:
-                self.report({'INFO'}, "Rotation offset copied")
-            else:
-                self.report({'INFO'}, f"Rotation offsets for {len(selected)} bones copied")
-        except Exception as e:
-            self.report({'ERROR'}, f"Copy failed: {e}")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == 'ARMATURE' and obj.mode == 'POSE' and not _is_transform_running()
-
-
-class LIVEOFFSET_OT_paste_rotation(Operator):
-    bl_idname = "liveoffset.paste_rotation"
-    bl_label = "Paste Rotation Offset"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        clipboard = context.window_manager.clipboard.strip()
-        if not clipboard:
-            self.report({'WARNING'}, "Clipboard is empty")
-            return {'CANCELLED'}
-
-        try:
-            data = json.loads(clipboard)
-        except json.JSONDecodeError:
-            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
-            return {'CANCELLED'}
-
-        if not isinstance(data, dict) or not data.get("live_offset"):
-            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.live_offset_settings
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        frame = float(context.scene.frame_current)
-
-        bones_data = data.get("bones")
-        if isinstance(bones_data, dict) and len(bones_data) > 1:
-            selected = context.selected_pose_bones or []
-            if not selected:
-                self.report({'WARNING'}, "Select target bones to paste multi-bone offsets")
-                return {'CANCELLED'}
-
-            source_names = list(bones_data.keys())
-            matched = 0
-            for bone in selected:
-                best = _find_best_bone_match(bone.name, source_names)
-                if best is None:
-                    continue
-                src = bones_data[best]
-                if "rot" not in src or len(src["rot"]) != 4:
-                    continue
-                rot = _apply_axis_mirrors(
-                    settings, src["rot"],
-                    is_rotation=True, rotation_mode=bone.rotation_mode
-                )
-                name = bone.name
-                if bone.rotation_mode == 'QUATERNION':
-                    path = f'pose.bones["{name}"].rotation_quaternion'
-                    for i in range(4):
-                        keyed = get_keyed_value(action, obj, path, i, frame)
-                        bone.rotation_quaternion[i] = (keyed + rot[i]) if keyed is not None else rot[i]
-                elif bone.rotation_mode == 'AXIS_ANGLE':
-                    path = f'pose.bones["{name}"].rotation_axis_angle'
-                    for i in range(4):
-                        keyed = get_keyed_value(action, obj, path, i, frame)
-                        bone.rotation_axis_angle[i] = (keyed + rot[i]) if keyed is not None else rot[i]
-                else:
-                    path = f'pose.bones["{name}"].rotation_euler'
-                    for i in range(3):
-                        keyed = get_keyed_value(action, obj, path, i, frame)
-                        bone.rotation_euler[i] = (keyed + rot[i]) if keyed is not None else rot[i]
-                matched += 1
-
-            sync_offsets_from_bone(context)
-            self.report({'INFO'}, f"Rotation offsets pasted to {matched} bone(s)")
-            return {'FINISHED'}
-
-        # Single / legacy
-        if isinstance(bones_data, dict) and len(bones_data) == 1:
-            rot_src = next(iter(bones_data.values())).get("rot")
-        else:
-            rot_src = data.get("rot")
-
-        if not rot_src or len(rot_src) != 4:
-            self.report({'WARNING'}, "Clipboard does not contain a valid Rotation Offset")
-            return {'CANCELLED'}
-
-        bone = context.active_pose_bone
-        rot_mode = bone.rotation_mode if bone else 'XYZ'
-
-        settings.suppress_update = True
-        try:
-            settings.rot_offset = _apply_axis_mirrors(
-                settings, rot_src, is_rotation=True, rotation_mode=rot_mode
-            )
-        except Exception as e:
-            settings.suppress_update = False
-            self.report({'ERROR'}, f"Paste failed: {e}")
-            return {'CANCELLED'}
-
-        settings.suppress_update = False
-        _update_rot(settings, context)
-        self.report({'INFO'}, "Rotation offset pasted")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class LIVEOFFSET_OT_copy_scale(Operator):
-    bl_idname = "liveoffset.copy_scale"
-    bl_label = "Copy Scale Offset"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        frame = float(context.scene.frame_current)
-        selected = context.selected_pose_bones or []
-
-        if not selected:
-            self.report({'WARNING'}, "No bones selected")
-            return {'CANCELLED'}
-
-        bones_data = {}
-        for bone in selected:
-            _, _, scale = _compute_offsets_for_bone(bone, obj, action, frame)
-            bones_data[bone.name] = {"scale": scale}
-
-        data = {
-            "live_offset": True,
-            "bones": bones_data,
-        }
-        if len(selected) == 1:
-            data["scale"] = bones_data[selected[0].name]["scale"]
-
-        try:
-            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
-            if len(selected) == 1:
-                self.report({'INFO'}, "Scale offset copied")
-            else:
-                self.report({'INFO'}, f"Scale offsets for {len(selected)} bones copied")
-        except Exception as e:
-            self.report({'ERROR'}, f"Copy failed: {e}")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return obj and obj.type == 'ARMATURE' and obj.mode == 'POSE' and not _is_transform_running()
-
-
-class LIVEOFFSET_OT_paste_scale(Operator):
-    bl_idname = "liveoffset.paste_scale"
-    bl_label = "Paste Scale Offset"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        clipboard = context.window_manager.clipboard.strip()
-        if not clipboard:
-            self.report({'WARNING'}, "Clipboard is empty")
-            return {'CANCELLED'}
-
-        try:
-            data = json.loads(clipboard)
-        except json.JSONDecodeError:
-            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
-            return {'CANCELLED'}
-
-        if not isinstance(data, dict) or not data.get("live_offset"):
-            self.report({'WARNING'}, "Clipboard does not contain valid Live Offset data")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.live_offset_settings
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        frame = float(context.scene.frame_current)
-
-        bones_data = data.get("bones")
-        if isinstance(bones_data, dict) and len(bones_data) > 1:
-            selected = context.selected_pose_bones or []
-            if not selected:
-                self.report({'WARNING'}, "Select target bones to paste multi-bone offsets")
-                return {'CANCELLED'}
-
-            source_names = list(bones_data.keys())
-            matched = 0
-            for bone in selected:
-                best = _find_best_bone_match(bone.name, source_names)
-                if best is None:
-                    continue
-                src = bones_data[best]
-                if "scale" not in src or len(src["scale"]) != 3:
-                    continue
-                scale = _apply_axis_mirrors(settings, src["scale"])
-                name = bone.name
-                for i in range(3):
-                    keyed = get_keyed_value(action, obj, f'pose.bones["{name}"].scale', i, frame)
-                    bone.scale[i] = (keyed + scale[i]) if keyed is not None else scale[i]
-                matched += 1
-
-            sync_offsets_from_bone(context)
-            self.report({'INFO'}, f"Scale offsets pasted to {matched} bone(s)")
-            return {'FINISHED'}
-
-        # Single / legacy
-        if isinstance(bones_data, dict) and len(bones_data) == 1:
-            scale_src = next(iter(bones_data.values())).get("scale")
-        else:
-            scale_src = data.get("scale")
-
-        if not scale_src or len(scale_src) != 3:
-            self.report({'WARNING'}, "Clipboard does not contain a valid Scale Offset")
-            return {'CANCELLED'}
-
-        settings.suppress_update = True
-        try:
-            settings.scale_offset = _apply_axis_mirrors(settings, scale_src)
-        except Exception as e:
-            settings.suppress_update = False
-            self.report({'ERROR'}, f"Paste failed: {e}")
-            return {'CANCELLED'}
-
-        settings.suppress_update = False
-        _update_scale(settings, context)
-        self.report({'INFO'}, "Scale offset pasted")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Transform Shortcuts Operators
-# ─────────────────────────────────────────────────────────────────────────────
-
-class TRANSFORMSHORTCUTS_OT_copy(Operator):
-    bl_idname = "transformshortcuts.copy"
-    bl_label = "Copy Transform"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        settings = context.window_manager.transform_shortcuts_settings
-        bone = context.active_pose_bone
-        data = {
-            "transform_shortcuts": True,
-            "location": list(settings.location),
-            "rotation": list(settings.rotation),
-            "scale":    list(settings.scale),
-            "rotation_mode": bone.rotation_mode if bone else "XYZ",
-        }
-        try:
-            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
-            self.report({'INFO'}, "Transform copied to clipboard")
-        except Exception as e:
-            self.report({'ERROR'}, f"Copy failed: {e}")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class TRANSFORMSHORTCUTS_OT_paste(Operator):
-    bl_idname = "transformshortcuts.paste"
-    bl_label = "Paste Transform"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        clipboard = context.window_manager.clipboard.strip()
-        if not clipboard:
-            self.report({'WARNING'}, "Clipboard is empty")
-            return {'CANCELLED'}
-
-        try:
-            data = json.loads(clipboard)
-        except json.JSONDecodeError:
-            self.report({'WARNING'}, "Clipboard does not contain valid Transform data")
-            return {'CANCELLED'}
-
-        if not isinstance(data, dict) or not data.get("transform_shortcuts"):
-            self.report({'WARNING'}, "Clipboard does not contain valid Transform data")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.transform_shortcuts_settings
-        bone = context.active_pose_bone
-        if not bone:
-            self.report({'WARNING'}, "No active pose bone")
-            return {'CANCELLED'}
-
-        settings.suppress_update = True
-        try:
-            if "location" in data and len(data["location"]) == 3:
-                settings.location = data["location"]
-            if "rotation" in data and len(data["rotation"]) == 4:
-                settings.rotation = data["rotation"]
-            if "scale" in data and len(data["scale"]) == 3:
-                settings.scale = data["scale"]
-        except Exception as e:
-            settings.suppress_update = False
-            self.report({'ERROR'}, f"Paste failed: {e}")
-            return {'CANCELLED'}
-
-        settings.suppress_update = False
-        _update_ts_loc(settings, context)
-        _update_ts_rot(settings, context)
-        _update_ts_scale(settings, context)
-
-        self.report({'INFO'}, "Transform pasted from clipboard")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class TRANSFORMSHORTCUTS_OT_refresh(Operator):
-    bl_idname = "transformshortcuts.refresh"
-    bl_label = "Refresh Transform"
-    bl_options = {'INTERNAL'}
-
-    def execute(self, context):
-        if not _is_transform_running():
-            sync_transforms_from_bone(context)
-        return {'FINISHED'}
-
-
-# Individual Transform Shortcuts Copy / Paste operators
-
-class TRANSFORMSHORTCUTS_OT_copy_location(Operator):
-    bl_idname = "transformshortcuts.copy_location"
-    bl_label = "Copy Location"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        settings = context.window_manager.transform_shortcuts_settings
-        data = {
-            "transform_shortcuts": True,
-            "location": list(settings.location),
-        }
-        try:
-            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
-            self.report({'INFO'}, "Location copied")
-        except Exception as e:
-            self.report({'ERROR'}, f"Copy failed: {e}")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class TRANSFORMSHORTCUTS_OT_paste_location(Operator):
-    bl_idname = "transformshortcuts.paste_location"
-    bl_label = "Paste Location"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        clipboard = context.window_manager.clipboard.strip()
-        if not clipboard:
-            self.report({'WARNING'}, "Clipboard is empty")
-            return {'CANCELLED'}
-
-        try:
-            data = json.loads(clipboard)
-        except json.JSONDecodeError:
-            self.report({'WARNING'}, "Clipboard does not contain valid Transform data")
-            return {'CANCELLED'}
-
-        if not isinstance(data, dict) or not data.get("transform_shortcuts") or "location" not in data or len(data["location"]) != 3:
-            self.report({'WARNING'}, "Clipboard does not contain a valid Location")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.transform_shortcuts_settings
-        bone = context.active_pose_bone
-        if not bone:
-            self.report({'WARNING'}, "No active pose bone")
-            return {'CANCELLED'}
-
-        settings.suppress_update = True
-        try:
-            settings.location = data["location"]
-        except Exception as e:
-            settings.suppress_update = False
-            self.report({'ERROR'}, f"Paste failed: {e}")
-            return {'CANCELLED'}
-
-        settings.suppress_update = False
-        _update_ts_loc(settings, context)
-        self.report({'INFO'}, "Location pasted")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class TRANSFORMSHORTCUTS_OT_copy_rotation(Operator):
-    bl_idname = "transformshortcuts.copy_rotation"
-    bl_label = "Copy Rotation"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        settings = context.window_manager.transform_shortcuts_settings
-        bone = context.active_pose_bone
-        data = {
-            "transform_shortcuts": True,
-            "rotation": list(settings.rotation),
-            "rotation_mode": bone.rotation_mode if bone else "XYZ",
-        }
-        try:
-            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
-            self.report({'INFO'}, "Rotation copied")
-        except Exception as e:
-            self.report({'ERROR'}, f"Copy failed: {e}")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class TRANSFORMSHORTCUTS_OT_paste_rotation(Operator):
-    bl_idname = "transformshortcuts.paste_rotation"
-    bl_label = "Paste Rotation"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        clipboard = context.window_manager.clipboard.strip()
-        if not clipboard:
-            self.report({'WARNING'}, "Clipboard is empty")
-            return {'CANCELLED'}
-
-        try:
-            data = json.loads(clipboard)
-        except json.JSONDecodeError:
-            self.report({'WARNING'}, "Clipboard does not contain valid Transform data")
-            return {'CANCELLED'}
-
-        if not isinstance(data, dict) or not data.get("transform_shortcuts") or "rotation" not in data or len(data["rotation"]) != 4:
-            self.report({'WARNING'}, "Clipboard does not contain a valid Rotation")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.transform_shortcuts_settings
-        bone = context.active_pose_bone
-        if not bone:
-            self.report({'WARNING'}, "No active pose bone")
-            return {'CANCELLED'}
-
-        settings.suppress_update = True
-        try:
-            settings.rotation = data["rotation"]
-        except Exception as e:
-            settings.suppress_update = False
-            self.report({'ERROR'}, f"Paste failed: {e}")
-            return {'CANCELLED'}
-
-        settings.suppress_update = False
-        _update_ts_rot(settings, context)
-        self.report({'INFO'}, "Rotation pasted")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class TRANSFORMSHORTCUTS_OT_copy_scale(Operator):
-    bl_idname = "transformshortcuts.copy_scale"
-    bl_label = "Copy Scale"
-    bl_options = {'REGISTER'}
-
-    def execute(self, context):
-        settings = context.window_manager.transform_shortcuts_settings
-        data = {
-            "transform_shortcuts": True,
-            "scale": list(settings.scale),
-        }
-        try:
-            context.window_manager.clipboard = json.dumps(data, separators=(',', ':'))
-            self.report({'INFO'}, "Scale copied")
-        except Exception as e:
-            self.report({'ERROR'}, f"Copy failed: {e}")
-            return {'CANCELLED'}
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-class TRANSFORMSHORTCUTS_OT_paste_scale(Operator):
-    bl_idname = "transformshortcuts.paste_scale"
-    bl_label = "Paste Scale"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        clipboard = context.window_manager.clipboard.strip()
-        if not clipboard:
-            self.report({'WARNING'}, "Clipboard is empty")
-            return {'CANCELLED'}
-
-        try:
-            data = json.loads(clipboard)
-        except json.JSONDecodeError:
-            self.report({'WARNING'}, "Clipboard does not contain valid Transform data")
-            return {'CANCELLED'}
-
-        if not isinstance(data, dict) or not data.get("transform_shortcuts") or "scale" not in data or len(data["scale"]) != 3:
-            self.report({'WARNING'}, "Clipboard does not contain a valid Scale")
-            return {'CANCELLED'}
-
-        settings = context.window_manager.transform_shortcuts_settings
-        bone = context.active_pose_bone
-        if not bone:
-            self.report({'WARNING'}, "No active pose bone")
-            return {'CANCELLED'}
-
-        settings.suppress_update = True
-        try:
-            settings.scale = data["scale"]
-        except Exception as e:
-            settings.suppress_update = False
-            self.report({'ERROR'}, f"Paste failed: {e}")
-            return {'CANCELLED'}
-
-        settings.suppress_update = False
-        _update_ts_scale(settings, context)
-        self.report({'INFO'}, "Scale pasted")
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and context.active_pose_bone and not _is_transform_running()
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Anim Shortcuts – Loop Detection (prefer-period aware)
-# ─────────────────────────────────────────────────────────────────────────────
-
-_MIN_LOOP_FRAMES = 8          # never accept extremely short periods
-_ROOT_NAME_PATTERNS = (
-    "root", "hips", "hip", "pelvis", "cog", "center", "master",
-    "armature", "origin", "motion", "mover", "body", "torso"
+import bpy
+
+
+IK_FK_PROPERTY = 'IK_FK'
+CONSTRAINT_TAG = 'UE_DIRECT_RETARGET'
+HELPER_COLLECTION = 'UE_DIRECT_RETARGET_HELPERS'
+HELPER_PREFIX = 'UE_DIRECT_RETARGET_OFFSET'
+
+COPY_ROTATION = 'COPY_ROTATION'
+COPY_LOCATION = 'COPY_LOCATION'
+COPY_TRANSFORMS = 'COPY_TRANSFORMS'
+ROOT = 'ROOT'
+SPINE_FK_PREFIX = 'spine_fk'
+TWEAK_SPINE_PREFIX = 'tweak_spine'
+TORSO_CONTROLS = {'hips', 'torso', 'chest'}
+FINGER_CONTROL_PREFIXES = (
+    'thumb.',
+    'f_index.',
+    'f_middle.',
+    'f_ring.',
+    'f_pinky.',
 )
 
+LIMB_FK_CONTROL_PREFIXES = (
+    'upper_arm_fk.',
+    'forearm_fk.',
+    'hand_fk.',
+    'thigh_fk.',
+    'shin_fk.',
+    'foot_fk.',
+)
+LIMB_TWEAK_CONTROL_PREFIXES = (
+    'upper_arm_tweak.',
+    'forearm_tweak.',
+    'hand_tweak.',
+    'thigh_tweak.',
+    'shin_tweak.',
+    'foot_tweak.',
+)
+IK_END_CONTROLS = {
+    'hand_ik.L',
+    'hand_ik.R',
+    'foot_ik.L',
+    'foot_ik.R',
+}
 
-def _is_root_bone(bone_name):
-    lower = bone_name.lower()
-    return any(p in lower for p in _ROOT_NAME_PATTERNS)
+
+def _side_pairs(left_source, right_source, left_control, right_control, constraint_type):
+    return [
+        {'source': left_source, 'control': left_control, 'type': constraint_type},
+        {'source': right_source, 'control': right_control, 'type': constraint_type},
+    ]
 
 
-def _bone_name_from_path(data_path):
-    """Extract the bone name from a pose-bone data_path.
-    Handles both double- and single-quoted forms.
+def _finger_pairs(finger_name, control_name):
+    mappings = []
+    for source_side, control_side in [('l', 'L'), ('r', 'R')]:
+        for index in ('01', '02', '03'):
+            mappings.append({
+                'source': f'{finger_name}_{index}_{source_side}',
+                'control': f'{control_name}.{index}.{control_side}',
+                'type': COPY_ROTATION,
+            })
+    return mappings
+
+
+def _common_finger_mappings():
+    mappings = []
+    mappings.extend(_finger_pairs('thumb', 'thumb'))
+    mappings.extend(_finger_pairs('index', 'f_index'))
+    mappings.extend(_finger_pairs('middle', 'f_middle'))
+    mappings.extend(_finger_pairs('ring', 'f_ring'))
+    mappings.extend(_finger_pairs('pinky', 'f_pinky'))
+    return mappings
+
+
+def _mixamo_finger_mappings():
+    """Return standard Mixamo finger links, including its 2-based names."""
+    mappings = []
+    finger_pairs = (
+        ('Thumb', 'thumb'),
+        ('Index', 'f_index'),
+        ('Middle', 'f_middle'),
+        ('Ring', 'f_ring'),
+        ('Pinky', 'f_pinky'),
+    )
+    segment_pairs = (('2', '01'), ('3', '02'), ('4', '03'))
+    for source_side, control_side in (('Left', 'L'), ('Right', 'R')):
+        for source_finger, control_finger in finger_pairs:
+            for source_segment, control_segment in segment_pairs:
+                mappings.append({
+                    'source': (
+                        f'mixamorig:{source_side}Hand'
+                        f'{source_finger}{source_segment}'
+                    ),
+                    'control': (
+                        f'{control_finger}.{control_segment}.{control_side}'
+                    ),
+                    'type': COPY_ROTATION,
+                })
+    return mappings
+
+
+def _tweak_mappings():
+    """Return UE mannequin secondary-control links from the official template."""
+    mappings = []
+    for source_side, control_side in [('l', 'L'), ('r', 'R')]:
+        mappings.extend([
+            {'source': f'upperarm_correctiveRoot_{source_side}', 'control': f'upper_arm_tweak.{control_side}', 'type': COPY_TRANSFORMS},
+            {'source': f'upperarm_twist_01_{source_side}', 'control': f'upper_arm_tweak.{control_side}.001', 'type': COPY_TRANSFORMS},
+            {'source': f'upperarm_twist_02_{source_side}', 'control': f'upper_arm_tweak.{control_side}.002', 'type': COPY_TRANSFORMS},
+            {'source': f'lowerarm_correctiveRoot_{source_side}', 'control': f'forearm_tweak.{control_side}', 'type': COPY_TRANSFORMS},
+            {'source': f'lowerarm_twist_02_{source_side}', 'control': f'forearm_tweak.{control_side}.001', 'type': COPY_TRANSFORMS},
+            {'source': f'lowerarm_twist_01_{source_side}', 'control': f'forearm_tweak.{control_side}.002', 'type': COPY_TRANSFORMS},
+            {'source': f'hand_{source_side}', 'control': f'hand_tweak.{control_side}', 'type': COPY_TRANSFORMS},
+            {'source': f'thigh_correctiveRoot_{source_side}', 'control': f'thigh_tweak.{control_side}', 'type': COPY_TRANSFORMS},
+            {'source': f'thigh_twist_01_{source_side}', 'control': f'thigh_tweak.{control_side}.001', 'type': COPY_TRANSFORMS},
+            {'source': f'thigh_twist_02_{source_side}', 'control': f'thigh_tweak.{control_side}.002', 'type': COPY_TRANSFORMS},
+            {'source': f'calf_correctiveRoot_{source_side}', 'control': f'shin_tweak.{control_side}', 'type': COPY_TRANSFORMS},
+            {'source': f'calf_twist_02_{source_side}', 'control': f'shin_tweak.{control_side}.001', 'type': COPY_TRANSFORMS},
+            {'source': f'calf_twist_01_{source_side}', 'control': f'shin_tweak.{control_side}.002', 'type': COPY_TRANSFORMS},
+            {'source': f'foot_{source_side}', 'control': f'foot_tweak.{control_side}', 'type': COPY_TRANSFORMS},
+            {'source': f'clavicle_pec_{source_side}', 'control': f'breast.{control_side}', 'type': COPY_TRANSFORMS},
+        ])
+    return mappings
+
+
+def _spine_tweak_mappings():
+    """Return the lower-torso links used by the UE2Rigify templates.
+
+    The first two spine tweaks establish the pelvis and lower-spine anchors
+    used by Rigify's torso mechanism. They are distinct from the remaining
+    automatically generated tweak controls, which must not be substituted for
+    missing FK controls.
     """
-    if data_path.startswith('pose.bones["'):
-        end = data_path.find('"]')
-        if end != -1:
-            return data_path[12:end]
-    if data_path.startswith("pose.bones['"):
-        end = data_path.find("']")
-        if end != -1:
-            return data_path[12:end]
-    return data_path
+    return [
+        {'source': 'pelvis', 'control': TWEAK_SPINE_PREFIX, 'type': COPY_TRANSFORMS},
+        {'source': 'spine_01', 'control': f'{TWEAK_SPINE_PREFIX}.001', 'type': COPY_TRANSFORMS},
+    ]
 
 
-def _is_location_channel(data_path):
-    return ".location" in data_path
+def _ue4_spine_base_mappings():
+    """Anchor the UE4 FK spine without animating its torso master controls.
+
+    The direct retargeter intentionally leaves the ``hips``, ``torso``, and
+    ``chest`` widgets untouched. Their world-space transforms are high-level
+    Rigify mechanism controls; constraining them alongside the FK chain makes
+    the upper body inherit a second pelvis translation. The base FK control is
+    sufficient to establish the pelvis anchor for the animated spine chain.
+    """
+    return [
+        {'source': 'pelvis', 'control': SPINE_FK_PREFIX, 'type': COPY_TRANSFORMS},
+    ]
 
 
-def _should_compare_channel(data_path, settings):
-    mode = settings.compare_mode
-    bone = _bone_name_from_path(data_path)
-    is_loc = _is_location_channel(data_path)
-
-    if mode == 'ALL':
-        return True
-    if mode == 'ROT_SCALE':
-        return not is_loc
-    if mode == 'ALL_EXCEPT_ROOT_LOC':
-        if is_loc and settings.ignore_root_location and _is_root_bone(bone):
-            return False
-        return True
-    return True
+def _spine_fk_mappings(source_controls):
+    """Map a spine chain with the rest-relative transforms UE2Rigify uses."""
+    return [
+        {
+            'source': source_bone,
+            'control': control_bone,
+            'type': COPY_TRANSFORMS,
+        }
+        for source_bone, control_bone in source_controls
+    ]
 
 
-def _collect_pose_fcurves(action, obj, settings):
-    fcurves = _get_action_fcurves(action, obj)
-    if fcurves is None:
+def _source_spine_bones(profile_id):
+    """Return source spine segments ordered from pelvis to chest."""
+    return {
+        'UE4_MANNY': ('spine_01', 'spine_02', 'spine_03'),
+        'UE5_MANNY': ('spine_01', 'spine_02', 'spine_03', 'spine_04', 'spine_05'),
+        'UEFN': ('spine_01', 'spine_02', 'spine_03', 'spine_04', 'spine_05'),
+        'MIXAMO': (
+            'mixamorig:Spine',
+            'mixamorig:Spine1',
+            'mixamorig:Spine2',
+        ),
+    }[profile_id]
+
+
+def _source_hip_bone(profile_id):
+    """Return the source bone that represents the pelvis."""
+    if profile_id == 'MIXAMO':
+        return 'mixamorig:Hips'
+    return 'pelvis'
+
+
+def _source_fk_bones(profile_id):
+    """Return source joints matching a generic Rigify FK spine in order."""
+    return (_source_hip_bone(profile_id), *_source_spine_bones(profile_id))
+
+
+def _torso_control_mappings(profile_id):
+    """Represent the source spine with Rigify's three broad torso controls.
+
+    ``torso`` carries pelvis translation for the whole chain. ``hips`` then
+    carries the pelvis orientation without duplicating that translation, and
+    ``chest`` carries the top spine transform relative to the translated torso.
+    Rigify distributes the hips/chest deltas over its lower and upper spine,
+    producing an editable approximation without individual spine FK keys.
+    """
+    hip_bone = _source_hip_bone(profile_id)
+
+    if profile_id == 'MIXAMO':
+        # Root location already comes from the Mixamo base profile (full Hips
+        # translation on root). Only add the high-level orientation controls
+        # here so we do not double-constrain root.
+        #
+        # Chest must be rotation-only. COPY_TRANSFORMS pulls the chest widget
+        # to Spine2's world position; on a deep bend that is far from the
+        # pelvis along a curve, and Rigify's shorter spine chain stretches
+        # to connect them — the elongated torso in the viewport. Orientation
+        # from Spine2 is enough; arm IK / shoulders still drive the limbs.
+        return [
+            {
+                'source': hip_bone,
+                'control': 'hips',
+                'type': COPY_ROTATION,
+            },
+            {
+                'source': _source_spine_bones(profile_id)[-1],
+                'control': 'chest',
+                'type': COPY_ROTATION,
+            },
+        ]
+
+    return [
+        {
+            'source': hip_bone,
+            'control': 'torso',
+            'type': COPY_LOCATION,
+        },
+        {
+            'source': hip_bone,
+            'control': 'hips',
+            'type': COPY_TRANSFORMS,
+        },
+        {
+            'source': _source_spine_bones(profile_id)[-1],
+            'control': 'chest',
+            'type': COPY_TRANSFORMS,
+        },
+    ]
+
+
+def _ik_mappings():
+    return [
+        {'source': 'ik_hand_l', 'control': 'hand_ik.L', 'type': COPY_TRANSFORMS},
+        {'source': 'ik_hand_r', 'control': 'hand_ik.R', 'type': COPY_TRANSFORMS},
+        {'source': 'ik_foot_l', 'control': 'foot_ik.L', 'type': COPY_TRANSFORMS},
+        {'source': 'ik_foot_r', 'control': 'foot_ik.R', 'type': COPY_TRANSFORMS},
+    ]
+
+
+def _ik_driven_mappings(profile_id):
+    """Drive Rigify IK controls from the evaluated source limb pose.
+
+    Deform hand and foot joints always describe the visible end-effector pose,
+    so they are the reliable source for an IK-authored bake. Rest-relative
+    lower-limb motion carries Rigify's pole controls with the source elbow and
+    knee plane.
+
+    Mixamo never uses this path — its limb proportions usually differ from the
+    Rigify target, so world-space IK end effectors misplace elbows and knees.
+    Mixamo always keeps the FK limb mappings from the profile.
+    """
+    if profile_id == 'MIXAMO':
         return []
 
-    result = []
-    for fc in fcurves:
-        if not fc.data_path.startswith('pose.bones[') or fc.lock or fc.mute:
-            continue
-        if _should_compare_channel(fc.data_path, settings):
-            result.append((fc, fc.data_path, fc.array_index))
-    return result
-
-
-def _get_action_frame_range(fcurves):
-    min_f = float('inf')
-    max_f = float('-inf')
-    has_keys = False
-    for fc, _, _ in fcurves:
-        for kp in fc.keyframe_points:
-            t = kp.co[0]
-            min_f = min(min_f, t)
-            max_f = max(max_f, t)
-            has_keys = True
-    if not has_keys:
-        return None
-    return (math.floor(min_f), math.ceil(max_f))
-
-
-def _channel_diff(fc, frame_a, frame_b):
-    return abs(fc.evaluate(frame_a) - fc.evaluate(frame_b))
-
-
-def _find_breaking_channels(fcurves, start, period, end, tol):
-    breaking = defaultdict(list)
-    for fc, data_path, array_index in fcurves:
-        max_diff = 0.0
-        worst_frame = start
-        for f in range(int(start), int(start + period)):
-            if f + period > end:
-                break
-            d = _channel_diff(fc, f, f + period)
-            if d > max_diff:
-                max_diff = d
-                worst_frame = f
-        if max_diff > tol:
-            bone = _bone_name_from_path(data_path)
-            short = data_path.split('"].')[-1] if '"].' in data_path else data_path
-            breaking[bone].append((short, array_index, max_diff, worst_frame))
-    return dict(breaking)
-
-
-def _pose_matches(fcurves, frame_a, frame_b, tol):
-    for fc, _, _ in fcurves:
-        if _channel_diff(fc, frame_a, frame_b) > tol:
-            return False
-    return True
-
-
-def _is_valid_period(fcurves, start, period, end, tol):
-    if period < _MIN_LOOP_FRAMES:
-        return False
-    if start + period > end:
-        return False
-    if not _pose_matches(fcurves, start, start + period, tol):
-        return False
-    for f in range(int(start), int(start + period)):
-        if f + period > end:
-            break
-        if not _pose_matches(fcurves, f, f + period, tol):
-            return False
-    return True
-
-
-def _score_period(period, prefer, n_breaking, total_bones):
-    """
-    Lower score = better.
-    Heavily rewards being close to the preferred period and having few breaking bones.
-    """
-    # Distance from preferred (normalised)
-    dist = abs(period - prefer) / max(prefer, 1)
-    # Breaking ratio
-    break_ratio = n_breaking / max(total_bones, 1)
-    # Combined score (distance is weighted higher so we prefer the right length)
-    return dist * 3.0 + break_ratio
-
-
-def detect_loop_period(context, tol=None):
-    """Return (start, period) for a perfect loop near the preferred length, or (None, None)."""
-    settings = context.window_manager.anim_shortcuts_settings
-    if tol is None:
-        tol = settings.loop_tolerance
-    prefer = settings.prefer_period
-
-    obj = context.active_object
-    if not obj or obj.type != 'ARMATURE' or not obj.animation_data or not obj.animation_data.action:
-        return None, None
-
-    action = obj.animation_data.action
-    fcurves = _collect_pose_fcurves(action, obj, settings)
-    if not fcurves:
-        return None, None
-
-    frame_range = _get_action_frame_range(fcurves)
-    if frame_range is None:
-        return None, None
-
-    start, end = frame_range
-    total_len = end - start
-    if total_len < _MIN_LOOP_FRAMES * 2:
-        return None, None
-
-    # Search a window around the preferred period
-    search_min = max(_MIN_LOOP_FRAMES, int(prefer * 0.6))
-    search_max = min(int(total_len // 2), int(prefer * 1.6) + 1)
-
-    best = None  # (score, period)
-
-    for period in range(search_min, search_max + 1):
-        if start + period > end:
-            continue
-        if _is_valid_period(fcurves, start, period, end, tol):
-            score = _score_period(period, prefer, 0, 1)
-            if best is None or score < best[0]:
-                best = (score, period)
-
-    if best is None:
-        return None, None
-    return start, best[1]
-
-
-def find_best_almost_loop(context, tol=None):
-    """
-    Find the best period near the preferred length even if not perfect.
-    Returns (start, period, breaking_dict).
-    """
-    settings = context.window_manager.anim_shortcuts_settings
-    if tol is None:
-        tol = settings.loop_tolerance
-    prefer = settings.prefer_period
-
-    obj = context.active_object
-    if not obj or obj.type != 'ARMATURE' or not obj.animation_data or not obj.animation_data.action:
-        return None, None, {}
-
-    action = obj.animation_data.action
-    fcurves = _collect_pose_fcurves(action, obj, settings)
-    if not fcurves:
-        return None, None, {}
-
-    frame_range = _get_action_frame_range(fcurves)
-    if frame_range is None:
-        return None, None, {}
-
-    start, end = frame_range
-    total_len = end - start
-    if total_len < _MIN_LOOP_FRAMES * 2:
-        return None, None, {}
-
-    total_bones = len({_bone_name_from_path(dp) for _, dp, _ in fcurves})
-
-    search_min = max(_MIN_LOOP_FRAMES, int(prefer * 0.5))
-    search_max = min(int(total_len // 2), int(prefer * 1.8) + 1)
-
-    best = None  # (score, period, breaking)
-
-    for period in range(search_min, search_max + 1):
-        if start + period > end:
-            continue
-        breaking = _find_breaking_channels(fcurves, start, period, end, tol)
-        n_break = len(breaking)
-        score = _score_period(period, prefer, n_break, total_bones)
-
-        if best is None or score < best[0]:
-            best = (score, period, breaking)
-
-        # Early perfect match near preferred
-        if n_break == 0 and abs(period - prefer) < prefer * 0.15:
-            break
-
-    if best is None:
-        return None, None, {}
-    return start, best[1], best[2]
-
-
-def get_action_total_length(context):
-    """Helper: return total keyed length of the active action."""
-    obj = context.active_object
-    if not obj or not obj.animation_data or not obj.animation_data.action:
-        return 0
-    settings = context.window_manager.anim_shortcuts_settings
-    fcurves = _collect_pose_fcurves(obj.animation_data.action, obj, settings)
-    if not fcurves:
-        # fallback – look at all fcurves
-        fcurves = _get_action_fcurves(obj.animation_data.action, obj) or []
-        fcurves = [(fc, fc.data_path, fc.array_index) for fc in fcurves]
-    fr = _get_action_frame_range(fcurves)
-    if fr is None:
-        return 0
-    return fr[1] - fr[0]
-
-
-def center_character_horizontal(action, obj, axes=(0, 1)):
-    """
-    Center a Rigify (or similar) character horizontally relative to the root.
-
-    Only high-level control bones that the animator actually keys are touched.
-    Priority:
-      1. torso
-      2. hips
-      3. other direct children of root that look like controls
-      4. other non-technical bones with non-zero location keys (last resort)
-
-    Technical bones (ORG-, DEF-, MCH-, tweak, etc.) and the root itself
-    are never modified.
-
-    When writing a key the bone's location axis is first reset to 0 and the
-    view layer is updated so no ghost / residual pose values are baked in.
-    Z is never touched.
-
-    Returns (frames_processed, bones_adjusted, keys_touched).
-    """
-    from mathutils import Vector
-
-    # Collect unique key times
-    frames = set()
-    for fc in _iter_all_fcurves(action):
-        if not fc.data_path.startswith('pose.bones["'):
-            continue
-        for kp in fc.keyframe_points:
-            frames.add(round(kp.co.x, 6))
-    if not frames:
-        return 0, set(), 0
-    sorted_frames = sorted(frames)
-
-    # Root detection
-    root_names = set()
-    for bone in obj.data.bones:
-        if _is_root_bone(bone.name):
-            root_names.add(bone.name)
-
-    primary_root_name = None
-    for name in sorted(root_names):
-        if name in obj.pose.bones:
-            primary_root_name = name
-            break
-    if primary_root_name is None:
-        # Rigify almost always has a bone literally named "root"
-        if "root" in obj.pose.bones:
-            primary_root_name = "root"
-            root_names.add("root")
-    if primary_root_name is None:
-        return 0, set(), 0
-
-    def _is_technical(name):
-        """Bones that must never be touched."""
-        lower = name.lower()
-        if lower in root_names or name in root_names:
-            return True
-        prefixes = ("org-", "def-", "mch-", "vis_", "wgt-")
-        if any(lower.startswith(p) or name.startswith(p.upper()) or name.startswith(p) for p in prefixes):
-            return True
-        tokens = ("tweak", "twk", "adj", "adjust", "corrective", "fix", "helper",
-                  "driver", "mechanism", "parent")
-        return any(tok in lower for tok in tokens)
-
-    # Preferred control bones (Rigify order)
-    preferred = ["torso", "hips", "chest", "spine_fk", "spine"]
-
-    # Gather all location F-curves that belong to non-technical bones
-    # and that have at least one non-zero key on the axes we care about.
-    candidates = {}  # bone_name -> {axis: FCurve}
-    for fc in _iter_all_fcurves(action):
-        path = fc.data_path
-        if not path.startswith('pose.bones["') or ".location" not in path:
-            continue
-        if fc.lock or fc.mute or fc.array_index not in axes:
-            continue
-        bone_name = _bone_name_from_path(path)
-        if _is_technical(bone_name):
-            continue
-        has_nonzero = any(abs(kp.co.y) > 1e-6 for kp in fc.keyframe_points)
-        if not has_nonzero:
-            continue
-        candidates.setdefault(bone_name, {})[fc.array_index] = fc
-
-    if not candidates:
-        return 0, set(), 0
-
-    # Decide which bones to actually correct (priority list)
-    target_bones = []
-    for name in preferred:
-        if name in candidates:
-            target_bones.append(name)
-            break  # prefer a single main control (torso or hips)
-
-    if not target_bones:
-        # Fallback: direct children of root that are in candidates
-        root_data = obj.data.bones.get(primary_root_name)
-        if root_data:
-            for child in root_data.children:
-                if child.name in candidates:
-                    target_bones.append(child.name)
-        # Still nothing? take any remaining candidates (last resort)
-        if not target_bones:
-            target_bones = list(candidates.keys())
-
-    # Build the final fcurve map only for the chosen bones
-    body_fcs = {}
-    for bname in target_bones:
-        for axis, fc in candidates[bname].items():
-            body_fcs[(bname, axis)] = fc
-
-    if not body_fcs:
-        return 0, set(), 0
-
-    scene = bpy.context.scene
-    orig_frame = scene.frame_current
-    processed = 0
-    keys_touched = 0
-    bones_adj = set()
-
-    try:
-        for t in sorted_frames:
-            scene.frame_set(int(round(t)))
-            bpy.context.view_layer.update()
-
-            root_pb = obj.pose.bones.get(primary_root_name)
-            if root_pb is None:
-                continue
-            root_pos = root_pb.matrix.translation.copy()
-
-            # Average relative position of the *chosen* control bones
-            avg_rel = Vector((0.0, 0.0, 0.0))
-            count = 0
-            for bname in target_bones:
-                pb = obj.pose.bones.get(bname)
-                if pb is None:
-                    continue
-                rel = pb.matrix.translation - root_pos
-                avg_rel += rel
-                count += 1
-            if count == 0:
-                continue
-            avg_rel /= count
-
-            world_delta = Vector((0.0, 0.0, 0.0))
-            if 0 in axes:
-                world_delta.x = -avg_rel.x
-            if 1 in axes:
-                world_delta.y = -avg_rel.y
-
-            if abs(world_delta.x) < 1e-9 and abs(world_delta.y) < 1e-9:
-                continue
-
-            for bname in target_bones:
-                pb = obj.pose.bones.get(bname)
-                if pb is None:
-                    continue
-
-                # world → local
-                parent = pb.parent
-                if parent is not None:
-                    try:
-                        local_delta = parent.matrix.inverted().to_3x3() @ world_delta
-                    except Exception:
-                        local_delta = world_delta.copy()
-                else:
-                    local_delta = world_delta.copy()
-
-                for axis in axes:
-                    key = (bname, axis)
-                    fc = body_fcs.get(key)
-                    if fc is None:
-                        continue
-
-                    axis_delta = local_delta[axis]
-                    if abs(axis_delta) < 1e-9:
-                        continue
-
-                    # ----- clean key writing -----
-                    old_loc = pb.location.copy()
-                    pb.location[axis] = 0.0
-                    bpy.context.view_layer.update()
-
-                    pure_curve_val = fc.evaluate(t)
-                    new_val = pure_curve_val + axis_delta
-
-                    pb.location = old_loc  # restore
-
-                    found = False
-                    for kp in fc.keyframe_points:
-                        if abs(kp.co.x - t) < 1e-4:
-                            dy = new_val - kp.co.y
-                            kp.co.y = new_val
-                            kp.handle_left.y += dy
-                            kp.handle_right.y += dy
-                            found = True
-                            keys_touched += 1
-                            break
-                    if not found and len(fc.keyframe_points) > 0:
-                        new_kp = fc.keyframe_points.insert(t, new_val, options={'FAST'})
-                        new_kp.handle_left_type = 'AUTO_CLAMPED'
-                        new_kp.handle_right_type = 'AUTO_CLAMPED'
-                        keys_touched += 1
-
-                    fc.update()
-                bones_adj.add(bname)
-
-            processed += 1
-    finally:
-        scene.frame_set(orig_frame)
-        bpy.context.view_layer.update()
-
-    return processed, bones_adj, keys_touched
-
-
-
-def truncate_after_loop(action, obj, start, period):
-    fcurves = _get_action_fcurves(action, obj)
-    if fcurves is None:
-        return 0
-    cutoff = start + period
-    removed = 0
-    for fc in fcurves:
-        for i in range(len(fc.keyframe_points) - 1, -1, -1):
-            if fc.keyframe_points[i].co[0] > cutoff + 1e-6:
-                fc.keyframe_points.remove(fc.keyframe_points[i])
-                removed += 1
-        fc.update()
-    return removed
-
-
-def homogenise_to_period(action, obj, start, period, settings):
-    fcurves = _get_action_fcurves(action, obj)
-    if fcurves is None:
-        return 0, set()
-
-    adjusted = 0
-    bones = set()
-
-    for fc in fcurves:
-        if not fc.data_path.startswith('pose.bones[') or fc.lock or fc.mute:
-            continue
-        # Preserve progressive root motion
-        if (settings.ignore_root_location
-                and _is_location_channel(fc.data_path)
-                and _is_root_bone(_bone_name_from_path(fc.data_path))):
-            continue
-
-        bone = _bone_name_from_path(fc.data_path)
-        changed = False
-        for kp in fc.keyframe_points:
-            t = kp.co[0]
-            if t < start - 1e-6:
-                continue
-            phase = (t - start) % period
-            ref_frame = start + phase
-            if t > start + period - 1e-6 or abs(t - (start + period)) < 1e-4:
-                ref_val = fc.evaluate(ref_frame)
-                dy = ref_val - kp.co[1]
-                if abs(dy) > 1e-9:
-                    kp.co[1] = ref_val
-                    kp.handle_left[1] += dy
-                    kp.handle_right[1] += dy
-                    adjusted += 1
-                    changed = True
-        if changed:
-            bones.add(bone)
-            fc.update()
-    return adjusted, bones
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Quaternion Homogenisation helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _collect_quat_fcurves_by_bone(action, obj=None):
-    """
-    Return dict: bone_name -> list of 4 F-Curves (or None) ordered as [W, X, Y, Z].
-    Only bones that have at least one rotation_quaternion channel are included.
-    """
-    by_bone = defaultdict(lambda: [None, None, None, None])
-    for fc in _iter_all_fcurves(action):
-        path = fc.data_path
-        if not path.startswith('pose.bones["') or ".rotation_quaternion" not in path:
-            continue
-        if fc.lock or fc.mute:
-            continue
-        bone = _bone_name_from_path(path)
-        idx = fc.array_index
-        if 0 <= idx <= 3:
-            by_bone[bone][idx] = fc
-    # Drop bones that have zero channels
-    return {b: fcs for b, fcs in by_bone.items() if any(fcs)}
-
-
-def _evaluate_quat_at(fcs, frame):
-    """Evaluate the four quaternion F-Curves at *frame*. Missing channels default to identity."""
-    defaults = (1.0, 0.0, 0.0, 0.0)
-    vals = []
-    for i, fc in enumerate(fcs):
-        if fc is not None:
-            vals.append(fc.evaluate(frame))
-        else:
-            vals.append(defaults[i])
-    return vals  # [w, x, y, z]
-
-
-def _flip_keyframe_point(kp):
-    """Negate value and handles of a single keyframe point (in-place)."""
-    kp.co.y = -kp.co.y
-    kp.handle_left.y = -kp.handle_left.y
-    kp.handle_right.y = -kp.handle_right.y
-
-
-def _homogenise_quat_fcurves(fcs, reference_fcs=None, reference_frames=None):
-    """
-    Make the quaternion trajectory continuous by flipping signs so that
-    consecutive samples have a positive dot product.
-
-    If *reference_fcs* is supplied (another set of 4 F-Curves), each sample
-    is instead forced to lie in the same hemisphere as the reference
-    evaluated at the same frame (source-dominating mode).
-
-    Returns the number of keyframe points that were flipped.
-    """
-    # Collect every unique keyframe time present on any of the four curves
-    frames = set()
-    for fc in fcs:
-        if fc is None:
-            continue
-        for kp in fc.keyframe_points:
-            frames.add(round(kp.co.x, 6))  # avoid tiny float noise
-    if not frames:
-        return 0
-
-    sorted_frames = sorted(frames)
-
-    # Decide for each frame whether a flip is required
-    need_flip = {}
-    prev_q = None
-
-    for t in sorted_frames:
-        q = _evaluate_quat_at(fcs, t)
-
-        if reference_fcs is not None:
-            # Source-dominating: match the hemisphere of the reference
-            ref_q = _evaluate_quat_at(reference_fcs, t)
-            # Dot product; if negative, flip this sample
-            dot = q[0]*ref_q[0] + q[1]*ref_q[1] + q[2]*ref_q[2] + q[3]*ref_q[3]
-            need_flip[t] = dot < 0.0
-        else:
-            # Self-homogenise: keep consecutive samples in the same hemisphere
-            if prev_q is None:
-                need_flip[t] = False
-            else:
-                dot = q[0]*prev_q[0] + q[1]*prev_q[1] + q[2]*prev_q[2] + q[3]*prev_q[3]
-                need_flip[t] = dot < 0.0
-            # Update the running previous quaternion (after possible flip)
-            if need_flip[t]:
-                prev_q = [-v for v in q]
-            else:
-                prev_q = q
-
-    # Apply the flips to the actual keyframe points
-    flipped = 0
-    for fc in fcs:
-        if fc is None:
-            continue
-        changed = False
-        for kp in fc.keyframe_points:
-            t = round(kp.co.x, 6)
-            if need_flip.get(t, False):
-                _flip_keyframe_point(kp)
-                flipped += 1
-                changed = True
-        if changed:
-            fc.update()
-
-    return flipped
-
-
-def homogenise_action_quaternions(action, obj=None, reference_action=None, reference_obj=None):
-    """
-    Homogenise every quaternion rotation channel in *action*.
-
-    If *reference_action* is given, each bone's quaternions are forced into
-    the same hemisphere as the corresponding bone in the reference action
-    (source-dominating mode). Otherwise the action is made self-consistent
-    (consecutive keyframes keep a positive dot product).
-
-    Returns (bones_processed, total_flipped_keys).
-    """
-    bone_fcs = _collect_quat_fcurves_by_bone(action, obj)
-    if not bone_fcs:
-        return 0, 0
-
-    ref_bone_fcs = None
-    if reference_action is not None:
-        ref_bone_fcs = _collect_quat_fcurves_by_bone(reference_action, reference_obj)
-
-    bones_done = 0
-    total_flipped = 0
-
-    for bone_name, fcs in bone_fcs.items():
-        ref_fcs = None
-        if ref_bone_fcs is not None:
-            ref_fcs = ref_bone_fcs.get(bone_name)
-            # If the bone does not exist in the reference, fall back to self-homogenise
-            if ref_fcs is None or not any(ref_fcs):
-                ref_fcs = None
-
-        flipped = _homogenise_quat_fcurves(fcs, reference_fcs=ref_fcs)
-        if flipped:
-            bones_done += 1
-            total_flipped += flipped
-
-    return bones_done, total_flipped
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Anim Shortcuts Operators
-# ─────────────────────────────────────────────────────────────────────────────
-
-class ANIMSHORTCUTS_OT_set_prefer_half(Operator):
-    """Set Prefer Period Length to half the total action length"""
-    bl_idname = "animshortcuts.set_prefer_half"
-    bl_label = "Set to Half Length"
-    bl_options = {'INTERNAL'}
-
-    def execute(self, context):
-        total = get_action_total_length(context)
-        if total < 4:
-            self.report({'WARNING'}, "Action is too short")
-            return {'CANCELLED'}
-        settings = context.window_manager.anim_shortcuts_settings
-        settings.prefer_period = max(4, int(round(total / 2)))
-        self.report({'INFO'}, f"Prefer Period set to {settings.prefer_period} (half of {total})")
-        return {'FINISHED'}
-
-
-class ANIMSHORTCUTS_OT_detect_loop(Operator):
-    bl_idname = "animshortcuts.detect_loop"
-    bl_label = "Detect Loop"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        settings = context.window_manager.anim_shortcuts_settings
-        tol = settings.loop_tolerance
-
-        start, period = detect_loop_period(context, tol=tol)
-
-        if start is not None and period is not None:
-            scene = context.scene
-            scene.frame_start = int(start)
-            scene.frame_end = int(start + period)
-            scene.frame_preview_start = int(start)
-            scene.frame_preview_end = int(start + period)
-            scene.use_preview_range = True
-
-            self.report(
-                {'INFO'},
-                f"Loop detected: frames {int(start)} → {int(start + period)} "
-                f"(period = {period}, preferred = {settings.prefer_period})"
-            )
-            return {'FINISHED'}
-
-        # Diagnostics with preferred-period scoring
-        start, period, breaking = find_best_almost_loop(context, tol=tol)
-        if start is None:
-            self.report({'WARNING'}, "Could not find any usable loop candidate.")
-            return {'CANCELLED'}
-
-        print("\n========== LOOP DIAGNOSTICS ==========")
-        print(f"Preferred period      : {settings.prefer_period}")
-        print(f"Best candidate period : {period}")
-        print(f"Tolerance             : {tol:.4g}")
-        print(f"Compare mode          : {settings.compare_mode}")
-        print(f"Bones still breaking ({len(breaking)}):")
-        for bone, channels in sorted(breaking.items()):
-            print(f"  • {bone}")
-            for short, idx, max_diff, worst_f in channels:
-                print(f"      {short}[{idx}]  max Δ = {max_diff:.4g}  (frame {worst_f})")
-        print("======================================\n")
-
-        bone_list = ", ".join(sorted(breaking.keys())[:8])
-        if len(breaking) > 8:
-            bone_list += f" … (+{len(breaking)-8} more)"
-
-        self.report(
-            {'WARNING'},
-            f"No perfect loop. Best period={period} (preferred={settings.prefer_period}). "
-            f"Breaking bones ({len(breaking)}): {bone_list}. See System Console."
-        )
-        return {'CANCELLED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
-
-
-class ANIMSHORTCUTS_OT_detect_truncate_loop(Operator):
-    bl_idname = "animshortcuts.detect_truncate_loop"
-    bl_label = "Detect and Truncate Loop"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        settings = context.window_manager.anim_shortcuts_settings
-        tol = settings.loop_tolerance
-
-        start, period = detect_loop_period(context, tol=tol)
-        if start is None:
-            start, period, breaking = find_best_almost_loop(context, tol=tol)
-            if start is None:
-                self.report({'WARNING'}, "No usable loop found. Adjust Prefer Period or tolerance.")
-                return {'CANCELLED'}
-            self.report(
-                {'WARNING'},
-                f"No perfect loop – truncating best candidate (period={period}). "
-                f"{len(breaking)} bone(s) still differ."
-            )
-
-        obj = context.active_object
-        action = obj.animation_data.action
-        bpy.ops.ed.undo_push(message="Detect and Truncate Loop")
-
-        removed = truncate_after_loop(action, obj, start, period)
-
-        scene = context.scene
-        scene.frame_start = int(start)
-        scene.frame_end = int(start + period)
-        scene.frame_preview_start = int(start)
-        scene.frame_preview_end = int(start + period)
-        scene.use_preview_range = True
-        context.scene.frame_set(context.scene.frame_current)
-
-        self.report(
-            {'INFO'},
-            f"Truncated to frames {int(start)} → {int(start + period)} "
-            f"(period = {period}, removed {removed} keys)"
-        )
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
-
-
-class ANIMSHORTCUTS_OT_homogenise(Operator):
-    bl_idname = "animshortcuts.homogenise"
-    bl_label = "Homogenise Animation"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        settings = context.window_manager.anim_shortcuts_settings
-        tol = settings.loop_tolerance
-
-        start, period = detect_loop_period(context, tol=tol)
-        if start is None:
-            start, period, _ = find_best_almost_loop(context, tol=tol)
-
-        if start is None or period is None:
-            self.report({'WARNING'}, "Could not determine a usable loop period.")
-            return {'CANCELLED'}
-
-        obj = context.active_object
-        action = obj.animation_data.action
-        bpy.ops.ed.undo_push(message="Homogenise Animation")
-
-        adjusted, bones = homogenise_to_period(action, obj, start, period, settings)
-        removed = truncate_after_loop(action, obj, start, period)
-
-        scene = context.scene
-        scene.frame_start = int(start)
-        scene.frame_end = int(start + period)
-        scene.frame_preview_start = int(start)
-        scene.frame_preview_end = int(start + period)
-        scene.use_preview_range = True
-        context.scene.frame_set(context.scene.frame_current)
-
-        bone_list = ", ".join(sorted(bones)[:8])
-        if len(bones) > 8:
-            bone_list += f" … (+{len(bones)-8} more)"
-
-        self.report(
-            {'INFO'},
-            f"Homogenised to period {period}. Adjusted {adjusted} keys on {len(bones)} bones"
-            + (f" ({bone_list})" if bones else "")
-            + f". Removed {removed} extra keys."
-        )
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
-
-
-class ANIMSHORTCUTS_OT_homogenise_rotation(Operator):
-    """Make quaternion rotations continuous within the active Action.
-
-    Consecutive keyframes are forced to have a positive dot-product so that
-    Blender's component-wise interpolation never takes the long way around
-    (the classic "rapid spin" artefact).
-    """
-    bl_idname = "animshortcuts.homogenise_rotation"
-    bl_label = "Homogenise Rotation (Active)"
-    bl_description = (
-        "Flip quaternion signs on the active Action so consecutive keyframes "
-        "stay in the same hemisphere. Eliminates unwanted 360° spins caused "
-        "by interpolating between q and -q."
+    mappings = []
+    mappings.extend(_side_pairs(
+        'hand_l', 'hand_r', 'hand_ik.L', 'hand_ik.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs(
+        'foot_l', 'foot_r', 'foot_ik.L', 'foot_ik.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs(
+        'lowerarm_l',
+        'lowerarm_r',
+        'upper_arm_ik_target.L',
+        'upper_arm_ik_target.R',
+        COPY_LOCATION,
+    ))
+    mappings.extend(_side_pairs(
+        'calf_l',
+        'calf_r',
+        'thigh_ik_target.L',
+        'thigh_ik_target.R',
+        COPY_LOCATION,
+    ))
+    return mappings
+
+
+def _is_limb_fk_or_tweak_control(control_name):
+    return control_name.startswith(
+        LIMB_FK_CONTROL_PREFIXES + LIMB_TWEAK_CONTROL_PREFIXES)
+
+
+def _is_spine_fk_or_tweak_control(control_name):
+    return (
+        control_name == SPINE_FK_PREFIX
+        or control_name.startswith(f'{SPINE_FK_PREFIX}.')
+        or control_name == TWEAK_SPINE_PREFIX
+        or control_name.startswith(f'{TWEAK_SPINE_PREFIX}.')
     )
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        bpy.ops.ed.undo_push(message="Homogenise Rotation (Active)")
-
-        bones, flipped = homogenise_action_quaternions(action, obj)
-
-        if flipped == 0:
-            self.report({'INFO'}, "No quaternion flips were needed – already continuous")
-        else:
-            self.report(
-                {'INFO'},
-                f"Homogenised rotation: flipped {flipped} key(s) on {bones} bone(s)"
-            )
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
 
 
-class ANIMSHORTCUTS_OT_homogenise_rotation_to_source(Operator):
-    """Align quaternion signs of a target Action to the active (source) Action.
+def _is_finger_control(control_name):
+    return control_name.startswith(FINGER_CONTROL_PREFIXES)
 
-    For every bone that exists in both Actions, each keyframe of the target
-    is forced into the same quaternion hemisphere as the source evaluated at
-    the same frame. This makes the target follow the "dominating" orientation
-    established by the source.
-    """
-    bl_idname = "animshortcuts.homogenise_rotation_to_source"
-    bl_label = "Homogenise Target to Source"
-    bl_description = (
-        "Flip quaternion signs on the chosen Target Action so they match the "
-        "hemisphere of the active (source) Action at the same frames."
+
+def _apply_torso_control_mode(scene, mappings):
+    if not getattr(scene, 'udr_torso_controls', False):
+        return mappings
+
+    # Mixamo spine curvature cannot be approximated by hips+chest alone.
+    # Keep the profile's FK spine chain (Spine1/Spine2 → spine_fk) regardless
+    # of the high-level checkbox so deep bends still match the source.
+    if scene.udr_profile == 'MIXAMO':
+        return mappings
+
+    mappings = [
+        mapping
+        for mapping in mappings
+        if not _is_spine_fk_or_tweak_control(mapping['control'])
+        and mapping['control'] not in TORSO_CONTROLS
+    ]
+    return [*mappings, *_torso_control_mappings(scene.udr_profile)]
+
+
+def _apply_finger_mode(scene, mappings):
+    if getattr(scene, 'udr_bake_fingers', True):
+        return mappings
+    return [
+        mapping
+        for mapping in mappings
+        if not _is_finger_control(mapping['control'])
+    ]
+
+
+def _validate_authoring_controls(scene, source_rig, rigify_rig):
+    if not getattr(scene, 'udr_torso_controls', False):
+        return
+
+    missing_controls = sorted(
+        control_name
+        for control_name in TORSO_CONTROLS
+        if not rigify_rig.pose.bones.get(control_name)
     )
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active (source) Action")
-            return {'CANCELLED'}
-
-        src_action = obj.animation_data.action
-        settings = context.window_manager.anim_shortcuts_settings
-        target_name = settings.homogenize_target_action
-
-        if not target_name or target_name == "NONE":
-            self.report({'WARNING'}, "Choose a Homogenize Target Action in the dropdown")
-            return {'CANCELLED'}
-
-        tgt_action = bpy.data.actions.get(target_name)
-        if tgt_action is None:
-            self.report({'WARNING'}, f"Action '{target_name}' no longer exists")
-            return {'CANCELLED'}
-
-        if tgt_action == src_action:
-            self.report({'WARNING'}, "Source and Target are the same Action – use the Active button instead")
-            return {'CANCELLED'}
-
-        bpy.ops.ed.undo_push(message="Homogenise Target Rotation to Source")
-
-        bones, flipped = homogenise_action_quaternions(
-            tgt_action, obj,
-            reference_action=src_action, reference_obj=obj
+    if missing_controls:
+        raise ValueError(
+            'High-Level Torso Controls requires target controls: '
+            f'{", ".join(missing_controls)}.'
         )
 
-        if flipped == 0:
-            self.report(
-                {'INFO'},
-                f"No flips needed – '{tgt_action.name}' already matches source orientation"
-            )
-        else:
-            self.report(
-                {'INFO'},
-                f"Aligned '{tgt_action.name}' to source: flipped {flipped} key(s) on {bones} bone(s)"
-            )
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
-
-
-class ANIMSHORTCUTS_OT_copy_bones_to_action(Operator):
-    """Copy all keyframes of the selected pose bones from the active Action
-    into the Action chosen in the Target Action dropdown.
-
-    Only keyframes that fall inside the source curve's frame range are
-    overwritten. Existing keyframes on the target that lie completely
-    outside that range are preserved.
-    """
-    bl_idname = "animshortcuts.copy_bones_to_action"
-    bl_label = "Copy Selected Bones Keyframes"
-    bl_description = (
-        "Copy every keyframe belonging to the currently selected bones "
-        "from the active Action into the Target Action. Keyframes on the "
-        "target that do not overlap the source frame range are preserved."
+    source_bones = {
+        _source_hip_bone(scene.udr_profile),
+        _source_spine_bones(scene.udr_profile)[-1],
+    }
+    missing_source_bones = sorted(
+        bone_name
+        for bone_name in source_bones
+        if not _resolve_source_bone_name(source_rig, bone_name)
     )
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        obj = context.active_object
-        if not obj or obj.type != 'ARMATURE' or obj.mode != 'POSE':
-            self.report({'WARNING'}, "Select an Armature in Pose Mode")
-            return {'CANCELLED'}
-
-        anim_data = obj.animation_data
-        if not anim_data or not anim_data.action:
-            self.report({'WARNING'}, "No active Action on the armature")
-            return {'CANCELLED'}
-
-        src_action = anim_data.action
-        settings = context.window_manager.anim_shortcuts_settings
-        target_name = settings.target_action
-
-        if not target_name or target_name == "NONE":
-            self.report({'WARNING'}, "Choose a Target Action in the dropdown")
-            return {'CANCELLED'}
-
-        tgt_action = bpy.data.actions.get(target_name)
-        if tgt_action is None:
-            self.report({'WARNING'}, f"Action '{target_name}' no longer exists")
-            return {'CANCELLED'}
-
-        if tgt_action == src_action:
-            self.report({'WARNING'}, "Source and Target are the same Action")
-            return {'CANCELLED'}
-
-        selected = context.selected_pose_bones or []
-        if not selected:
-            self.report({'WARNING'}, "Select one or more bones first")
-            return {'CANCELLED'}
-
-        # Build set of data-path prefixes for the selected bones
-        bone_prefixes = {
-            f'pose.bones["{bone.name}"]' for bone in selected
-        }
-
-        # Collect source F-Curves that belong to the selected bones
-        src_fcurves = list(_iter_all_fcurves(src_action))
-        to_copy = []
-        for fc in src_fcurves:
-            path = fc.data_path
-            if any(path.startswith(prefix) for prefix in bone_prefixes):
-                to_copy.append(fc)
-
-        if not to_copy:
-            self.report({'INFO'}, "No keyframes found on the selected bones in the active Action")
-            return {'CANCELLED'}
-
-        bpy.ops.ed.undo_push(message="Copy Bones Keyframes to Action")
-
-        copied_channels = 0
-        skipped = 0
-        bones_touched = set()
-
-        for src_fc in to_copy:
-            tgt_fc = _ensure_fcurve(
-                tgt_action, obj, src_fc.data_path, src_fc.array_index
-            )
-            if tgt_fc is None:
-                skipped += 1
-                continue
-
-            _copy_fcurve_keyframes(src_fc, tgt_fc)
-            copied_channels += 1
-
-            # Extract bone name for reporting
-            bone = _bone_name_from_path(src_fc.data_path)
-            if bone:
-                bones_touched.add(bone)
-
-        msg = (
-            f"Copied {copied_channels} channel(s) for {len(bones_touched)} bone(s) "
-            f"from '{src_action.name}' → '{tgt_action.name}'"
-        )
-        if skipped:
-            msg += f" ({skipped} channel(s) could not be created)"
-        self.report({'INFO'}, msg)
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and context.selected_pose_bones
-            and not _is_transform_running()
+    if missing_source_bones:
+        raise ValueError(
+            'High-Level Torso Controls requires source bones: '
+            f'{", ".join(missing_source_bones)}.'
         )
 
 
-
-class ANIMSHORTCUTS_OT_center_character(Operator):
-    """Recenter the whole character on every keyframe (horizontal only).
-
-    Computes the average world-space position of all pose bones at each
-    unique keyframe, then counter-shifts the root bone(s) so the character
-    sits at the origin in X/Y.  Vertical (Z) motion is left completely free.
-    """
-    bl_idname = "animshortcuts.center_character"
-    bl_label = "Center Character (Zero X/Y)"
-    bl_description = (
-        "At every keyframe, shift the root bone(s) so the character's "
-        "average position is at the world origin in X and Y. "
-        "Up/down (Z) is never touched. Use when the body drifts away "
-        "from the origin even though the root itself stays near zero."
-    )
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        bpy.ops.ed.undo_push(message="Center Character Horizontal")
-
-        processed, bones, keys = center_character_horizontal(action, obj, axes=(0, 1))
-
-        if processed == 0:
-            self.report(
-                {'INFO'},
-                "Nothing to do – character already centred or no usable keys found"
-            )
-        else:
-            bone_list = ", ".join(sorted(bones)[:6])
-            if len(bones) > 6:
-                bone_list += f" … (+{len(bones)-6} more)"
-            self.report(
-                {'INFO'},
-                f"Centred {processed} frame(s), touched {keys} key(s) on body bone(s): {bone_list}"
-            )
-
-        context.scene.frame_set(context.scene.frame_current)
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
-
-
-
-def _clear_keys_matching(action, name_predicate, obj=None):
-    """
-    Remove every keyframe (and the F-Curve itself if emptied) whose bone name
-    matches *name_predicate(bone_name) -> bool*.
-
-    Prefer the channelbag belonging to *obj*'s current action slot (critical for
-    Blender 4.4+/5.x slotted Actions). Fall back to a full scan of every
-    layer/strip/channelbag so nothing is missed.
-
-    Returns (channels_cleared, keys_removed, bone_names_set).
-    """
-    to_clear = []          # list of (collection, fc)
-    bones = set()
-    seen = set()           # (data_path, array_index) – avoid double-processing
-
-    def _consider(collection, fc):
-        path = fc.data_path
-        # Accept both double- and single-quoted data paths
-        if not (path.startswith('pose.bones["') or path.startswith("pose.bones['")):
-            return
-        bone = _bone_name_from_path(path)
-        if not name_predicate(bone):
-            return
-        key = (path, fc.array_index)
-        if key in seen:
-            return
-        seen.add(key)
-        to_clear.append((collection, fc))
-        bones.add(bone)
-
-    # ------------------------------------------------------------------
-    # 1. Prefer the active object's own slot (most important path)
-    # ------------------------------------------------------------------
-    if obj is not None:
-        try:
-            from bpy_extras import anim_utils
-            anim_data = obj.animation_data
-            slot = getattr(anim_data, "action_slot", None) if anim_data else None
-            if slot is not None:
-                bag = anim_utils.action_get_channelbag_for_slot(action, slot)
-                if bag is not None:
-                    for fc in list(bag.fcurves):
-                        _consider(bag.fcurves, fc)
-        except Exception:
-            pass
-
-        # Also try the helper that already understands slots / legacy proxy
-        fcurves = _get_action_fcurves(action, obj)
-        if fcurves is not None:
-            for fc in list(fcurves):
-                _consider(fcurves, fc)
-
-    # ------------------------------------------------------------------
-    # 2. Legacy top-level fcurves (first slot proxy)
-    # ------------------------------------------------------------------
-    legacy = getattr(action, "fcurves", None)
-    if legacy is not None:
-        try:
-            for fc in list(legacy):
-                _consider(legacy, fc)
-        except (TypeError, AttributeError):
-            pass
-
-    # ------------------------------------------------------------------
-    # 3. Full scan of every layer / strip / channelbag
-    # ------------------------------------------------------------------
-    for layer in getattr(action, "layers", []) or []:
-        for strip in getattr(layer, "strips", []) or []:
-            bags = getattr(strip, "channelbags", None)
-            if bags:
-                for bag in bags:
-                    for fc in list(bag.fcurves):
-                        _consider(bag.fcurves, fc)
-            else:
-                for slot in getattr(action, "slots", []) or []:
-                    try:
-                        bag = strip.channelbag(slot)
-                    except Exception:
-                        bag = None
-                    if bag is not None:
-                        for fc in list(bag.fcurves):
-                            _consider(bag.fcurves, fc)
-
-    # ------------------------------------------------------------------
-    # 4. Ultimate fallback – walk every slot via anim_utils
-    # ------------------------------------------------------------------
-    try:
-        from bpy_extras import anim_utils
-        for slot in getattr(action, "slots", []) or []:
-            bag = anim_utils.action_get_channelbag_for_slot(action, slot)
-            if bag is not None:
-                for fc in list(bag.fcurves):
-                    _consider(bag.fcurves, fc)
-    except Exception:
-        pass
-
-    # ------------------------------------------------------------------
-    # Remove keyframes + empty F-Curves
-    # ------------------------------------------------------------------
-    keys_removed = 0
-    channels = 0
-    for collection, fc in to_clear:
-        n = len(fc.keyframe_points)
-        if n == 0:
-            continue
-        while len(fc.keyframe_points):
-            fc.keyframe_points.remove(fc.keyframe_points[0])
-        keys_removed += n
-        channels += 1
-        try:
-            collection.remove(fc)
-        except Exception:
-            pass
-
-    return channels, keys_removed, bones
-
-
-def _is_tweak_bone(name):
-    """True for any bone whose name indicates a tweak / twk control.
-    Catches Rigify-style (forearm_tweak.L, upper_arm_tweak.R.001, …)
-    as well as shorter 'twk' abbreviations.
-    """
-    lower = name.lower()
-    return any(tok in lower for tok in (
-        "tweak", "twk",
+def _is_arm_fk_or_tweak_control(control_name):
+    return control_name.startswith((
+        'upper_arm_fk.',
+        'forearm_fk.',
+        'hand_fk.',
+        'upper_arm_tweak.',
+        'forearm_tweak.',
+        'hand_tweak.',
     ))
 
 
-def _is_fk_bone(name):
-    lower = name.lower()
-    # Rigify FK controls: upper_arm_fk.L, thigh_fk.R, spine_fk, hand_fk, etc.
-    if "_fk" in lower or lower.endswith(".fk") or lower.startswith("fk_"):
-        return True
-    # Also catch plain "fk" token as a whole word-ish match
-    parts = lower.replace(".", " ").replace("_", " ").split()
-    return "fk" in parts
+def _is_leg_fk_or_tweak_control(control_name):
+    return control_name.startswith((
+        'thigh_fk.',
+        'shin_fk.',
+        'foot_fk.',
+        'thigh_tweak.',
+        'shin_tweak.',
+        'foot_tweak.',
+    ))
 
 
-class ANIMSHORTCUTS_OT_clear_tweak_keys(Operator):
-    """Delete every keyframe that belongs to a tweak bone."""
-    bl_idname = "animshortcuts.clear_tweak_keys"
-    bl_label = "Clear Tweak Keyframes"
-    bl_description = (
-        "Remove all keyframes on bones whose names contain 'tweak' / 'twk'. "
-        "Useful for cleaning up accidental tweak animation."
-    )
-    bl_options = {'REGISTER', 'UNDO'}
+def _apply_drive_mode(scene, mappings):
+    if not getattr(scene, 'udr_ik_driven', False):
+        return mappings
 
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
+    profile_id = scene.udr_profile
 
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
+    # Mixamo always keeps FK limb mappings. World-space IK end effectors
+    # fail when Mixamo and Rigify proportions differ (both arms and legs).
+    if profile_id == 'MIXAMO':
+        return mappings
 
-        action = obj.animation_data.action
-        bpy.ops.ed.undo_push(message="Clear Tweak Keyframes")
-
-        channels, keys, bones = _clear_keys_matching(action, _is_tweak_bone, obj=obj)
-
-        if keys == 0:
-            self.report({'INFO'}, "No tweak keyframes found")
-        else:
-            bone_list = ", ".join(sorted(bones)[:8])
-            if len(bones) > 8:
-                bone_list += f" … (+{len(bones)-8} more)"
-            self.report(
-                {'INFO'},
-                f"Cleared {keys} key(s) on {channels} channel(s) / {len(bones)} tweak bone(s): {bone_list}"
-            )
-
-        context.scene.frame_set(context.scene.frame_current)
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
+    # Default: full IK for arms and legs.
+    mappings = [
+        mapping
+        for mapping in mappings
+        if mapping['control'] not in IK_END_CONTROLS
+        and not _is_limb_fk_or_tweak_control(mapping['control'])
+    ]
+    return [*mappings, *_ik_driven_mappings(profile_id)]
 
 
-class ANIMSHORTCUTS_OT_clear_fk_keys(Operator):
-    """Delete every keyframe that belongs to an FK bone."""
-    bl_idname = "animshortcuts.clear_fk_keys"
-    bl_label = "Clear FK Keyframes"
-    bl_description = (
-        "Remove all keyframes on FK control bones (names containing '_fk', "
-        "'.fk', etc.). Useful after switching to IK or cleaning FK animation."
-    )
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
-
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
-
-        action = obj.animation_data.action
-        bpy.ops.ed.undo_push(message="Clear FK Keyframes")
-
-        channels, keys, bones = _clear_keys_matching(action, _is_fk_bone, obj=obj)
-
-        if keys == 0:
-            self.report({'INFO'}, "No FK keyframes found")
-        else:
-            bone_list = ", ".join(sorted(bones)[:8])
-            if len(bones) > 8:
-                bone_list += f" … (+{len(bones)-8} more)"
-            self.report(
-                {'INFO'},
-                f"Cleared {keys} key(s) on {channels} channel(s) / {len(bones)} FK bone(s): {bone_list}"
-            )
-
-        context.scene.frame_set(context.scene.frame_current)
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
+def _ue4_profile():
+    mappings = [
+        {'source': 'object', 'control': 'root', 'type': ROOT},
+        {'source': 'neck_01', 'control': 'neck', 'type': COPY_ROTATION},
+        {'source': 'head', 'control': 'head', 'type': COPY_ROTATION},
+    ]
+    mappings.extend(_spine_fk_mappings([
+        ('spine_01', 'spine_fk.001'),
+        ('spine_02', 'spine_fk.002'),
+        ('spine_03', 'spine_fk.003'),
+    ]))
+    mappings.extend(_side_pairs('clavicle_l', 'clavicle_r', 'shoulder.L', 'shoulder.R', COPY_ROTATION))
+    mappings.extend(_side_pairs('upperarm_l', 'upperarm_r', 'upper_arm_fk.L', 'upper_arm_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('lowerarm_l', 'lowerarm_r', 'forearm_fk.L', 'forearm_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('hand_l', 'hand_r', 'hand_fk.L', 'hand_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('thigh_l', 'thigh_r', 'thigh_fk.L', 'thigh_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('calf_l', 'calf_r', 'shin_fk.L', 'shin_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('foot_l', 'foot_r', 'foot_fk.L', 'foot_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('ball_l', 'ball_r', 'toe.L', 'toe.R', COPY_TRANSFORMS))
+    mappings.extend(_ue4_spine_base_mappings())
+    mappings.extend(_spine_tweak_mappings())
+    mappings.extend(_tweak_mappings())
+    mappings.extend(_common_finger_mappings())
+    mappings.extend(_ik_mappings())
+    return mappings
 
 
+def _ue5_profile():
+    mappings = [
+        {'source': 'object', 'control': 'root', 'type': ROOT},
+        # These controls have a parent-space offset above spine_fk.008. Copy
+        # their complete rest-relative transform, as the UE5 UE2Rigify
+        # template does, so their world-space position stays on the spine.
+        {'source': 'neck_02', 'control': 'neck', 'type': COPY_TRANSFORMS},
+        {'source': 'head', 'control': 'head', 'type': COPY_TRANSFORMS},
+    ]
+    mappings.extend(_spine_fk_mappings([
+        ('spine_01', 'spine_fk'),
+        ('spine_02', 'spine_fk.001'),
+        # The UE5 template has an extra FK control at the spine_02 joint.
+        ('spine_02', 'spine_fk.002'),
+        ('spine_03', 'spine_fk.003'),
+        ('spine_04', 'spine_fk.007'),
+        ('spine_05', 'spine_fk.008'),
+    ]))
+    mappings.extend(_side_pairs('clavicle_l', 'clavicle_r', 'shoulder.L', 'shoulder.R', COPY_ROTATION))
+    mappings.extend(_side_pairs('upperarm_l', 'upperarm_r', 'upper_arm_fk.L', 'upper_arm_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('lowerarm_l', 'lowerarm_r', 'forearm_fk.L', 'forearm_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('hand_l', 'hand_r', 'hand_fk.L', 'hand_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('thigh_l', 'thigh_r', 'thigh_fk.L', 'thigh_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('calf_l', 'calf_r', 'shin_fk.L', 'shin_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('foot_l', 'foot_r', 'foot_fk.L', 'foot_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('ball_l', 'ball_r', 'toe.L', 'toe.R', COPY_TRANSFORMS))
+    mappings.extend(_spine_tweak_mappings())
+    mappings.extend(_tweak_mappings())
+    mappings.extend(_common_finger_mappings())
+    mappings.extend(_ik_mappings())
+    return mappings
 
-def _is_finger_bone(name):
-    """Individual finger bones (NOT the master controls).
-    Matches: f_index.01.L, f_middle.02.R, thumb.03.L, palm.01.L, etc.
-    Excludes anything containing 'master'.
+
+def _uefn_profile():
+    mappings = [
+        {'source': 'object', 'control': 'root', 'type': ROOT},
+        {'source': 'neck_02', 'control': 'neck', 'type': COPY_ROTATION},
+        {'source': 'head', 'control': 'head', 'type': COPY_ROTATION},
+    ]
+    mappings.extend(_spine_fk_mappings([
+        ('spine_01', 'spine_fk'),
+        ('spine_02', 'spine_fk.001'),
+        # The UEFN template uses the same expanded UE5 spine control layout.
+        ('spine_02', 'spine_fk.002'),
+        ('spine_03', 'spine_fk.003'),
+        ('spine_04', 'spine_fk.007'),
+        ('spine_05', 'spine_fk.008'),
+    ]))
+    mappings.extend(_side_pairs('clavicle_l', 'clavicle_r', 'shoulder.L', 'shoulder.R', COPY_ROTATION))
+    mappings.extend(_side_pairs('upperarm_l', 'upperarm_r', 'upper_arm_fk.L', 'upper_arm_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('lowerarm_l', 'lowerarm_r', 'forearm_fk.L', 'forearm_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('hand_l', 'hand_r', 'hand_fk.L', 'hand_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('thigh_l', 'thigh_r', 'thigh_fk.L', 'thigh_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('calf_l', 'calf_r', 'shin_fk.L', 'shin_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('foot_l', 'foot_r', 'foot_fk.L', 'foot_fk.R', COPY_TRANSFORMS))
+    mappings.extend(_side_pairs('ball_l', 'ball_r', 'toe.L', 'toe.R', COPY_TRANSFORMS))
+    mappings.extend(_spine_tweak_mappings())
+    mappings.extend(_tweak_mappings())
+    mappings.extend(_common_finger_mappings())
+    mappings.extend(_ik_mappings())
+    return mappings
+
+
+def _mixamo_profile():
+    """Return standard namespaced Mixamo-to-Rigify control mappings.
+
+    All Hips translation goes on the Rigify root so the whole hierarchy
+    moves with the pelvis.
+
+    Full Hips rotation goes on the torso master control (not Y-only) so
+    forward pelvic pitch on bends is preserved. Spine1/Spine2 drive the
+    upper FK spine. High-Level Torso Controls are ignored for Mixamo —
+    the hips+chest approximation cannot reproduce Mixamo spine curvature.
     """
-    lower = name.lower()
-    if "master" in lower:
-        return False
-    # Rigify finger / palm patterns
-    finger_tokens = (
-        "f_index", "f_middle", "f_ring", "f_pinky",
-        "thumb", "palm",
-    )
-    return any(tok in lower for tok in finger_tokens)
+    hips = 'mixamorig:Hips'
+    mappings = [
+        # Full Hips translation on root.
+        {
+            'source': hips,
+            'control': 'root',
+            'type': COPY_LOCATION,
+        },
+        # Full pelvic orientation on the torso master (pitch + twist + roll).
+        {
+            'source': hips,
+            'control': 'torso',
+            'type': COPY_ROTATION,
+        },
+        {
+            'source': 'mixamorig:Spine1',
+            'control': 'spine_fk.002',
+            'type': COPY_TRANSFORMS,
+        },
+        {
+            'source': 'mixamorig:Spine2',
+            'control': 'spine_fk.003',
+            'type': COPY_ROTATION,
+        },
+        {'source': 'mixamorig:Neck', 'control': 'neck', 'type': COPY_ROTATION},
+        {'source': 'mixamorig:Head', 'control': 'head', 'type': COPY_ROTATION},
+    ]
+    mappings.extend(_side_pairs(
+        'mixamorig:LeftShoulder',
+        'mixamorig:RightShoulder',
+        'shoulder.L',
+        'shoulder.R',
+        COPY_ROTATION,
+    ))
+    mappings.extend(_side_pairs(
+        'mixamorig:LeftArm',
+        'mixamorig:RightArm',
+        'upper_arm_fk.L',
+        'upper_arm_fk.R',
+        COPY_TRANSFORMS,
+    ))
+    mappings.extend(_side_pairs(
+        'mixamorig:LeftForeArm',
+        'mixamorig:RightForeArm',
+        'forearm_fk.L',
+        'forearm_fk.R',
+        COPY_TRANSFORMS,
+    ))
+    mappings.extend(_side_pairs(
+        'mixamorig:LeftHand',
+        'mixamorig:RightHand',
+        'hand_fk.L',
+        'hand_fk.R',
+        COPY_TRANSFORMS,
+    ))
+    mappings.extend(_side_pairs(
+        'mixamorig:LeftUpLeg',
+        'mixamorig:RightUpLeg',
+        'thigh_fk.L',
+        'thigh_fk.R',
+        COPY_TRANSFORMS,
+    ))
+    mappings.extend(_side_pairs(
+        'mixamorig:LeftLeg',
+        'mixamorig:RightLeg',
+        'shin_fk.L',
+        'shin_fk.R',
+        COPY_TRANSFORMS,
+    ))
+    mappings.extend(_side_pairs(
+        'mixamorig:LeftFoot',
+        'mixamorig:RightFoot',
+        'foot_fk.L',
+        'foot_fk.R',
+        COPY_TRANSFORMS,
+    ))
+    mappings.extend([
+        {
+            'source': 'mixamorig:LeftToeBase',
+            'control': 'toe.L',
+            'control_fallbacks': ('toe_fk.L',),
+            'type': COPY_TRANSFORMS,
+        },
+        {
+            'source': 'mixamorig:RightToeBase',
+            'control': 'toe.R',
+            'control_fallbacks': ('toe_fk.R',),
+            'type': COPY_TRANSFORMS,
+        },
+    ])
+    mappings.extend(_mixamo_finger_mappings())
+    return mappings
 
 
-def _is_finger_master(name):
-    """Finger master controls only.
-    Matches: f_index.01_master.L, thumb.01_master.R, etc.
+PROFILE_DEFINITIONS = {
+    'UE4_MANNY': {
+        'label': 'UE4 Manny',
+        'mappings': _ue4_profile(),
+    },
+    'UE5_MANNY': {
+        'label': 'UE5 Manny / Quinn',
+        'mappings': _ue5_profile(),
+    },
+    'UEFN': {
+        'label': 'UEFN Mannequin',
+        'mappings': _uefn_profile(),
+    },
+    'MIXAMO': {
+        'label': 'Mixamo',
+        'mappings': _mixamo_profile(),
+    },
+}
+
+PROFILE_ITEMS = [
+    (profile_id, profile_data['label'], profile_data['label'])
+    for profile_id, profile_data in PROFILE_DEFINITIONS.items()
+]
+
+INVERT_Z_CONTROLS = {
+    'thumb.02.L',
+    'thumb.03.L',
+    'thumb.02.R',
+    'thumb.03.R',
+}
+def armature_poll(self, obj):
+    return obj and obj.type == 'ARMATURE'
+
+
+def action_poll(self, obj):
+    return True
+
+
+def source_rig_update(self, context):
+    source_rig = self.udr_source_rig
+    if source_rig and source_rig.animation_data and source_rig.animation_data.action:
+        context.scene.udr_source_action = source_rig.animation_data.action
+
+
+def rigify_rig_update(self, context):
+    rigify_rig = self.udr_rigify_rig
+    if rigify_rig and rigify_rig.animation_data and rigify_rig.animation_data.action:
+        context.scene.udr_rigify_action = rigify_rig.animation_data.action
+
+
+def retarget_settings_update(self, context):
+    if not getattr(self, 'udr_enabled', False):
+        return
+    try:
+        add_constraints(self)
+    except Exception as error:
+        print(f'Direct Retarget: could not update retarget settings: {error}')
+
+
+def get_profile(scene):
+    return PROFILE_DEFINITIONS[scene.udr_profile]
+
+
+def _resolve_source_bone_name(source_rig, requested_name):
+    """Resolve a source bone across namespace export variations."""
+    if requested_name == 'object':
+        return requested_name
+    if source_rig.pose.bones.get(requested_name):
+        return requested_name
+
+    requested_basename = requested_name.rsplit(':', 1)[-1]
+    matches = [
+        pose_bone.name
+        for pose_bone in source_rig.pose.bones
+        if pose_bone.name.rsplit(':', 1)[-1] == requested_basename
+    ]
+    if len(matches) == 1:
+        return matches[0]
+    return None
+
+
+def _resolve_target_control_mappings(mappings, rigify_rig):
+    """Replace unavailable target names with profile-provided alternatives."""
+    if not rigify_rig:
+        return mappings
+
+    resolved_mappings = []
+    for mapping in mappings:
+        if rigify_rig.pose.bones.get(mapping['control']):
+            resolved_mappings.append(mapping)
+            continue
+
+        fallback = next((
+            control_name
+            for control_name in mapping.get('control_fallbacks', ())
+            if rigify_rig.pose.bones.get(control_name)
+        ), None)
+        if fallback:
+            mapping = {**mapping, 'control': fallback}
+        resolved_mappings.append(mapping)
+    return resolved_mappings
+
+
+def _profile_spine_fk_controls(mappings):
+    return [
+        mapping['control']
+        for mapping in mappings
+        if mapping['control'] == SPINE_FK_PREFIX
+        or mapping['control'].startswith(f'{SPINE_FK_PREFIX}.')
+    ]
+
+
+def _available_spine_fk_controls(rigify_rig):
+    """Return the target's primary FK spine controls from pelvis to chest.
+
+    The first two ``tweak_spine`` controls have their own template mappings,
+    but they are not a replacement FK chain when the target has fewer
+    ``spine_fk`` controls.
     """
-    lower = name.lower()
-    if "master" not in lower:
-        return False
-    finger_tokens = (
-        "f_index", "f_middle", "f_ring", "f_pinky",
-        "thumb", "palm",
+    control_names = [
+        pose_bone.name
+        for pose_bone in rigify_rig.pose.bones
+        if pose_bone.name == SPINE_FK_PREFIX
+        or pose_bone.name.startswith(f'{SPINE_FK_PREFIX}.')
+    ]
+
+    def spine_index(control_name):
+        if control_name == SPINE_FK_PREFIX:
+            return 0
+        return int(control_name.rsplit('.', 1)[1]) + 1
+
+    return sorted(control_names, key=spine_index)
+
+
+def _has_profile_spine_fk_controls(rigify_rig, mappings):
+    spine_controls = _profile_spine_fk_controls(mappings)
+    return bool(spine_controls) and all(
+        rigify_rig.pose.bones.get(control_name)
+        for control_name in spine_controls
     )
-    return any(tok in lower for tok in finger_tokens)
 
 
-class ANIMSHORTCUTS_OT_clear_finger_keys(Operator):
-    """Delete every keyframe on individual finger bones (masters are kept)."""
-    bl_idname = "animshortcuts.clear_finger_keys"
-    bl_label = "Clear Finger Keyframes"
-    bl_description = (
-        "Remove all keyframes on individual finger bones "
-        "(f_index, f_middle, f_ring, f_pinky, thumb, palm). "
-        "Finger master controls are left untouched."
-    )
-    bl_options = {'REGISTER', 'UNDO'}
+def _partial_spine_fk_mappings(profile_id, rigify_rig):
+    """Map a shorter generic Rigify spine by matching its joint topology.
 
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
+    A standard four-control Rigify spine represents pelvis through spine_03,
+    just like the working UE4 profile. Spreading UE5's five spine bones over
+    those controls maps the target chest directly to spine_05. Because these
+    are world-space transform links, that also copies translation accumulated
+    across the omitted spine_04/spine_05 joints and makes the chest slide
+    independently from its shorter target chain. Keep the available controls
+    consecutive instead; the rotation-only neck link carries the final UE5
+    upper-chain orientation without disconnecting its location from the chest.
+    """
+    if profile_id == 'MIXAMO':
+        # The Mixamo profile deliberately decomposes Hips motion between
+        # root and torso. Adding Hips to a fallback FK spine control would
+        # drive the same pelvis motion twice through the target hierarchy.
+        return []
 
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
+    control_bones = _available_spine_fk_controls(rigify_rig)
+    source_bones = _source_fk_bones(profile_id)
+    return _spine_fk_mappings(zip(source_bones, control_bones))
 
-        action = obj.animation_data.action
-        bpy.ops.ed.undo_push(message="Clear Finger Keyframes")
 
-        channels, keys, bones = _clear_keys_matching(action, _is_finger_bone, obj=obj)
-
-        if keys == 0:
-            self.report({'INFO'}, "No finger keyframes found")
+def get_profile_mappings(scene, rigify_rig=None):
+    """Get mappings compatible with the selected target Rigify spine layout."""
+    mappings = get_profile(scene)['mappings']
+    if not rigify_rig or _has_profile_spine_fk_controls(rigify_rig, mappings):
+        compatible_mappings = mappings
+    else:
+        partial_spine_mappings = _partial_spine_fk_mappings(
+            scene.udr_profile, rigify_rig)
+        if not partial_spine_mappings:
+            compatible_mappings = mappings
         else:
-            bone_list = ", ".join(sorted(bones)[:8])
-            if len(bones) > 8:
-                bone_list += f" … (+{len(bones)-8} more)"
-            self.report(
-                {'INFO'},
-                f"Cleared {keys} key(s) on {channels} channel(s) / {len(bones)} finger bone(s): {bone_list}"
-            )
+            # A standard Rigify human may have fewer primary spine controls
+            # than the UE templates. Map its available FK chain in order while
+            # retaining the two lower-torso tweak links used by the reference
+            # templates.
+            non_spine_mappings = []
+            for mapping in mappings:
+                control_name = mapping['control']
+                if (
+                    control_name == SPINE_FK_PREFIX
+                    or control_name.startswith(f'{SPINE_FK_PREFIX}.')
+                ):
+                    continue
 
-        context.scene.frame_set(context.scene.frame_current)
-        return {'FINISHED'}
+                # The expanded UE5 template can copy the neck and head
+                # translations because its rest chain and separate upper-spine
+                # controls match the mannequin. A generic Rigify human has one
+                # neck control in the same role as UE4 neck_01. Driving it from
+                # UE5 neck_02 folds the second neck joint's independent motion
+                # into that base control, making the neck/head sway separately
+                # from the shorter chest chain. Use neck_01 for that control
+                # and let the head's world rotation retain the total orientation
+                # through neck_02. Both locations remain connected to the
+                # target chain so its super_head mechanism does not stretch to
+                # catch independently translated endpoints.
+                if (
+                    scene.udr_profile == 'UE5_MANNY'
+                    and control_name in {'neck', 'head'}
+                ):
+                    mapping = {
+                        **mapping,
+                        'source': (
+                            'neck_01'
+                            if control_name == 'neck'
+                            else mapping['source']
+                        ),
+                        'type': COPY_ROTATION,
+                    }
+                non_spine_mappings.append(mapping)
 
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
+            compatible_mappings = [
+                *non_spine_mappings,
+                *partial_spine_mappings,
+            ]
+
+    compatible_mappings = _apply_torso_control_mode(
+        scene, compatible_mappings)
+    compatible_mappings = _apply_drive_mode(scene, compatible_mappings)
+    compatible_mappings = _apply_finger_mode(scene, compatible_mappings)
+    return _resolve_target_control_mappings(
+        compatible_mappings, rigify_rig)
+
+
+def build_links_data(scene):
+    links_data = []
+    for mapping in get_profile_mappings(scene, scene.udr_rigify_rig):
+        links_data.append({
+            'from_node': 'Source Rig',
+            'to_node': 'Control Rig',
+            'from_socket': mapping['source'],
+            'to_socket': mapping['control'],
+        })
+    return links_data
+
+
+def ensure_pose_mode(armature_object):
+    previous_object = bpy.context.view_layer.objects.active
+    previous_mode = bpy.context.mode
+
+    bpy.context.view_layer.objects.active = armature_object
+    armature_object.select_set(True)
+
+    if armature_object.mode != 'POSE':
+        bpy.ops.object.mode_set(mode='POSE')
+
+    return previous_object, previous_mode
+
+
+def restore_mode(previous_object, previous_mode):
+    try:
+        bpy.ops.object.mode_set(mode=previous_mode)
+    except Exception:
+        pass
+    finally:
+        bpy.context.view_layer.objects.active = previous_object
+
+
+def _save_ikfk_state(rigify_rig):
+    state = {}
+    for bone in rigify_rig.pose.bones:
+        if isinstance(bone.get(IK_FK_PROPERTY), float):
+            state[bone.name] = bone[IK_FK_PROPERTY]
+    return state
+
+
+def _restore_ikfk_state(rigify_rig, state_json):
+    if not state_json:
+        return
+
+    state = json.loads(state_json)
+    for bone_name, value in state.items():
+        bone = rigify_rig.pose.bones.get(bone_name)
+        if bone and isinstance(bone.get(IK_FK_PROPERTY), float):
+            bone[IK_FK_PROPERTY] = value
+
+
+def _set_drive_mode(rigify_rig, ik_driven, profile_id=None):
+    # Rigify's IK_FK convention is 0.0 for IK and 1.0 for FK.
+    # Mixamo always stays in FK — its limb proportions do not support
+    # reliable world-space IK retargeting onto a typical Rigify human.
+    if not ik_driven or profile_id == 'MIXAMO':
+        value = 1.0
+    else:
+        value = 0.0
+    for bone in rigify_rig.pose.bones:
+        if isinstance(bone.get(IK_FK_PROPERTY), float):
+            bone[IK_FK_PROPERTY] = value
+
+
+def _suspend_target_action_for_preview(scene, rigify_rig):
+    """Prevent an existing bake from adding motion during live retargeting."""
+    animation_data = rigify_rig.animation_data
+    if not animation_data:
+        return
+
+    if scene.udr_preview_action is None:
+        scene.udr_preview_action = animation_data.action
+    animation_data.action = None
+
+
+def _restore_target_action_after_preview(scene, rigify_rig):
+    """Restore the action that was active before live retargeting began."""
+    if rigify_rig.animation_data:
+        rigify_rig.animation_data.action = scene.udr_preview_action
+    scene.udr_preview_action = None
+
+
+def _remove_tagged_constraints(constraints):
+    for constraint in list(constraints):
+        if constraint.name.startswith(CONSTRAINT_TAG):
+            constraints.remove(constraint)
+
+
+def _clear_existing_constraints(rigify_rig):
+    _remove_tagged_constraints(rigify_rig.constraints)
+    for pose_bone in rigify_rig.pose.bones:
+        _remove_tagged_constraints(pose_bone.constraints)
+
+
+def _get_or_create_helper_collection():
+    helper_collection = bpy.data.collections.get(HELPER_COLLECTION)
+    if not helper_collection:
+        helper_collection = bpy.data.collections.new(HELPER_COLLECTION)
+        bpy.context.scene.collection.children.link(helper_collection)
+
+    helper_collection.hide_viewport = True
+    helper_collection.hide_render = True
+    return helper_collection
+
+
+def _clear_offset_helpers():
+    helper_collection = bpy.data.collections.get(HELPER_COLLECTION)
+    if not helper_collection:
+        return
+
+    for helper_object in list(helper_collection.objects):
+        bpy.data.objects.remove(helper_object, do_unlink=True)
+
+    bpy.data.collections.remove(helper_collection)
+
+
+def _create_offset_helpers(source_rig, rigify_rig, source_bone_name, control_bone_name):
+    """Create an offset chain that maps a source socket's rest delta to a control."""
+    control_data_bone = rigify_rig.data.bones.get(control_bone_name)
+    if not control_data_bone:
+        return None
+
+    if source_bone_name == 'object':
+        source_rest_matrix = source_rig.matrix_world.copy()
+    else:
+        source_data_bone = source_rig.data.bones.get(source_bone_name)
+        if not source_data_bone:
+            return None
+        source_rest_matrix = source_rig.matrix_world @ source_data_bone.matrix_local
+
+    helper_collection = _get_or_create_helper_collection()
+    source_helper = bpy.data.objects.new(
+        f'{HELPER_PREFIX}_SOURCE_{control_bone_name}', None)
+    control_helper = bpy.data.objects.new(
+        f'{HELPER_PREFIX}_CONTROL_{control_bone_name}', None)
+    helper_collection.objects.link(source_helper)
+    helper_collection.objects.link(control_helper)
+
+    source_helper.empty_display_type = 'PLAIN_AXES'
+    control_helper.empty_display_type = 'PLAIN_AXES'
+    source_helper.matrix_world = source_rest_matrix
+    control_helper.matrix_world = rigify_rig.matrix_world @ control_data_bone.matrix_local
+
+    # Keeping this world matrix while parenting makes the control helper inherit
+    # only the source bone's animation delta from its rest pose.
+    control_helper.parent = source_helper
+    control_helper.matrix_parent_inverse = source_helper.matrix_world.inverted()
+
+    source_constraint = source_helper.constraints.new(COPY_TRANSFORMS)
+    source_constraint.name = CONSTRAINT_TAG
+    source_constraint.target = source_rig
+    if source_bone_name != 'object':
+        source_constraint.subtarget = source_bone_name
+
+    return control_helper
+
+
+def _set_constraint_axes(constraint, mapping):
+    for axis_name in ('use_x', 'use_y', 'use_z'):
+        if axis_name in mapping:
+            setattr(constraint, axis_name, mapping[axis_name])
+
+
+def _add_copy_rotation_constraint(target_object, rigify_bone, mapping):
+    constraint = rigify_bone.constraints.new('COPY_ROTATION')
+    constraint.name = CONSTRAINT_TAG
+    constraint.target = target_object
+    constraint.target_space = 'WORLD'
+    constraint.owner_space = 'WORLD'
+    _set_constraint_axes(constraint, mapping)
+    if rigify_bone.name in INVERT_Z_CONTROLS:
+        constraint.invert_z = True
+
+
+def _add_copy_location_constraint(target_object, rigify_bone, mapping):
+    constraint = rigify_bone.constraints.new('COPY_LOCATION')
+    constraint.name = CONSTRAINT_TAG
+    constraint.target = target_object
+    constraint.target_space = 'WORLD'
+    constraint.owner_space = 'WORLD'
+    _set_constraint_axes(constraint, mapping)
+
+
+def _add_copy_transforms_constraint(target_object, rigify_bone):
+    constraint = rigify_bone.constraints.new('COPY_TRANSFORMS')
+    constraint.name = CONSTRAINT_TAG
+    constraint.target = target_object
+    constraint.target_space = 'WORLD'
+    constraint.owner_space = 'WORLD'
+
+
+def _ensure_all_bones_visible(rigify_rig):
+    collection_state = {}
+    for bone_collection in getattr(rigify_rig.data, 'collections_all', []):
+        collection_state[bone_collection.name] = (bone_collection.is_visible, bone_collection.is_solo)
+        bone_collection.is_visible = True
+        bone_collection.is_solo = False
+
+    bone_state = {}
+    for pose_bone in rigify_rig.pose.bones:
+        data_bone = pose_bone.bone
+        bone_state[pose_bone.name] = (data_bone.hide, pose_bone.select)
+        data_bone.hide = False
+        pose_bone.select = False
+
+    return collection_state, bone_state
+
+
+def _restore_visibility(rigify_rig, collection_state, bone_state):
+    for pose_bone in rigify_rig.pose.bones:
+        state = bone_state.get(pose_bone.name)
+        if state:
+            pose_bone.bone.hide, pose_bone.select = state
+
+    for bone_collection in getattr(rigify_rig.data, 'collections_all', []):
+        state = collection_state.get(bone_collection.name)
+        if state:
+            bone_collection.is_visible, bone_collection.is_solo = state
+
+
+def _get_or_create_target_action(scene, source_action, rigify_rig):
+    if scene.udr_rigify_action:
+        rigify_rig.animation_data.action = scene.udr_rigify_action
+        return scene.udr_rigify_action
+
+    target_action = bpy.data.actions.get(source_action.name)
+    if not target_action:
+        target_action = bpy.data.actions.new(source_action.name)
+
+    target_action.use_fake_user = True
+    rigify_rig.animation_data.action = target_action
+    return target_action
+
+
+def _bake_boundary_frames(start_frame, end_frame):
+    """Re-bake the clip's first/last frames so looping stays seamless.
+
+    ``bpy.ops.nla.bake`` steps forward from ``frame_start`` and is not
+    guaranteed to land exactly on ``frame_end`` when ``step`` does not evenly
+    divide the frame range, which would otherwise drop the final key needed
+    for a clean loop back to the first frame.
+    """
+    for frame in {start_frame, end_frame}:
+        bpy.ops.nla.bake(
+            frame_start=frame,
+            frame_end=frame,
+            step=1,
+            only_selected=True,
+            visual_keying=True,
+            clear_constraints=False,
+            use_current_action=True,
+            bake_types={'POSE'}
         )
 
 
-class ANIMSHORTCUTS_OT_clear_finger_master_keys(Operator):
-    """Delete every keyframe on finger master controls."""
-    bl_idname = "animshortcuts.clear_finger_master_keys"
-    bl_label = "Clear Finger Master Keyframes"
-    bl_description = (
-        "Remove all keyframes on finger master controls "
-        "(f_index.01_master, thumb.01_master, etc.)."
+def _get_bake_control_names(scene, rigify_rig):
+    control_names = []
+    for mapping in get_profile_mappings(scene, rigify_rig):
+        control_name = mapping['control']
+        if control_name not in control_names:
+            control_names.append(control_name)
+    return control_names
+
+
+def _select_bake_controls(rigify_rig, scene):
+    bpy.ops.pose.select_all(action='DESELECT')
+
+    for control_name in _get_bake_control_names(scene, rigify_rig):
+        # Blender 5.0+ removed Bone.select; selection now lives on PoseBone.
+        pose_bone = rigify_rig.pose.bones.get(control_name)
+        if pose_bone:
+            pose_bone.select = True
+
+
+def _action_channelbags(action):
+    """Iterate all F-Curve channelbags of a layered action."""
+    for layer in action.layers:
+        for strip in layer.strips:
+            channelbags = getattr(strip, 'channelbags', None)
+            if channelbags is not None:
+                yield from channelbags
+
+
+def _iter_action_fcurves(action):
+    """Iterate an action's F-Curves across legacy and layered-action forms.
+
+    Blender 5.1 removed the ``Action.fcurves`` compatibility shim; F-Curves
+    now live under channelbags nested in the action's layers/strips.
+    """
+    legacy_fcurves = getattr(action, 'fcurves', None)
+    if legacy_fcurves is not None:
+        yield from legacy_fcurves
+        return
+    for channelbag in _action_channelbags(action):
+        yield from channelbag.fcurves
+
+
+def _remove_action_fcurve(action, fcurve):
+    """Remove a single F-Curve, locating its channelbag on layered actions."""
+    legacy_fcurves = getattr(action, 'fcurves', None)
+    if legacy_fcurves is not None:
+        legacy_fcurves.remove(fcurve)
+        return
+    for channelbag in _action_channelbags(action):
+        for candidate in channelbag.fcurves:
+            if candidate == fcurve:
+                channelbag.fcurves.remove(fcurve)
+                return
+
+
+def _bone_transform_curves(action, pose_bone):
+    bone_path_prefix = f'{pose_bone.path_from_id()}.'
+    transform_properties = {
+        'location',
+        'rotation_axis_angle',
+        'rotation_euler',
+        'rotation_quaternion',
+        'scale',
+    }
+    curves = {property_name: [] for property_name in transform_properties}
+    for fcurve in _iter_action_fcurves(action):
+        if not fcurve.data_path.startswith(bone_path_prefix):
+            continue
+        property_name = fcurve.data_path[len(bone_path_prefix):]
+        if property_name in curves:
+            curves[property_name].append(fcurve)
+    return curves
+
+
+def _curve_frames(fcurves, start_frame, end_frame):
+    frames = {float(start_frame), float(end_frame)}
+    for fcurve in fcurves:
+        for keyframe in fcurve.keyframe_points:
+            frame = keyframe.co[0]
+            if start_frame <= frame <= end_frame:
+                frames.add(frame)
+    return sorted(frames)
+
+
+def _curve_components(fcurves, frame, defaults):
+    values = list(defaults)
+    for fcurve in fcurves:
+        if fcurve.array_index < len(values):
+            values[fcurve.array_index] = fcurve.evaluate(frame)
+    return values
+
+
+def _curves_are_clip_local(fcurves, start_frame, end_frame):
+    return all(
+        start_frame <= keyframe.co[0] <= end_frame
+        for fcurve in fcurves
+        for keyframe in fcurve.keyframe_points
     )
-    bl_options = {'REGISTER', 'UNDO'}
 
-    def execute(self, context):
-        if _is_transform_running():
-            self.report({'WARNING'}, "Finish the transform first")
-            return {'CANCELLED'}
 
-        obj = context.active_object
-        if not obj or not obj.animation_data or not obj.animation_data.action:
-            self.report({'WARNING'}, "No active Action")
-            return {'CANCELLED'}
+def _location_is_negligible(fcurves, start_frame, end_frame, threshold):
+    return all(
+        math.sqrt(sum(component * component for component in _curve_components(
+            fcurves, frame, (0.0, 0.0, 0.0)))) <= threshold
+        for frame in _curve_frames(fcurves, start_frame, end_frame)
+    )
 
-        action = obj.animation_data.action
-        bpy.ops.ed.undo_push(message="Clear Finger Master Keyframes")
 
-        channels, keys, bones = _clear_keys_matching(action, _is_finger_master, obj=obj)
+def _scale_is_negligible(fcurves, start_frame, end_frame, threshold):
+    return all(
+        max(abs(component - 1.0) for component in _curve_components(
+            fcurves, frame, (1.0, 1.0, 1.0))) <= threshold
+        for frame in _curve_frames(fcurves, start_frame, end_frame)
+    )
 
-        if keys == 0:
-            self.report({'INFO'}, "No finger-master keyframes found")
-        else:
-            bone_list = ", ".join(sorted(bones)[:8])
-            if len(bones) > 8:
-                bone_list += f" … (+{len(bones)-8} more)"
-            self.report(
-                {'INFO'},
-                f"Cleared {keys} key(s) on {channels} channel(s) / {len(bones)} finger-master bone(s): {bone_list}"
+
+def _quaternion_angle(components):
+    length = math.sqrt(sum(component * component for component in components))
+    if length <= 1e-12:
+        return math.pi
+    normalized_w = max(-1.0, min(1.0, components[0] / length))
+    return 2.0 * math.acos(abs(normalized_w))
+
+
+def _normalized_quaternion(components):
+    length = math.sqrt(sum(component * component for component in components))
+    if length <= 1e-12:
+        return (1.0, 0.0, 0.0, 0.0)
+    return tuple(component / length for component in components)
+
+
+def _axis_angle_quaternion(components):
+    angle, axis_x, axis_y, axis_z = components
+    axis_length = math.sqrt(axis_x ** 2 + axis_y ** 2 + axis_z ** 2)
+    if axis_length <= 1e-12:
+        return (1.0, 0.0, 0.0, 0.0)
+    half_angle = angle * 0.5
+    scale = math.sin(half_angle) / axis_length
+    return _normalized_quaternion((
+        math.cos(half_angle),
+        axis_x * scale,
+        axis_y * scale,
+        axis_z * scale,
+    ))
+
+
+def _slerp_quaternion(first, second, factor):
+    first = _normalized_quaternion(first)
+    second = _normalized_quaternion(second)
+    dot = sum(a * b for a, b in zip(first, second))
+    if dot < 0.0:
+        second = tuple(-component for component in second)
+        dot = -dot
+    dot = max(-1.0, min(1.0, dot))
+
+    if dot > 0.9995:
+        return _normalized_quaternion(tuple(
+            a + factor * (b - a)
+            for a, b in zip(first, second)
+        ))
+
+    angle = math.acos(dot)
+    sin_angle = math.sin(angle)
+    first_weight = math.sin((1.0 - factor) * angle) / sin_angle
+    second_weight = math.sin(factor * angle) / sin_angle
+    return tuple(
+        first_weight * a + second_weight * b
+        for a, b in zip(first, second)
+    )
+
+
+def _quaternion_distance(first, second):
+    first = _normalized_quaternion(first)
+    second = _normalized_quaternion(second)
+    dot = abs(sum(a * b for a, b in zip(first, second)))
+    return 2.0 * math.acos(max(-1.0, min(1.0, dot)))
+
+
+def _rotation_is_negligible(
+    rotation_property,
+    fcurves,
+    start_frame,
+    end_frame,
+    threshold,
+):
+    if rotation_property == 'rotation_quaternion':
+        defaults = (1.0, 0.0, 0.0, 0.0)
+        angle_at_frame = lambda frame: _quaternion_angle(
+            _curve_components(fcurves, frame, defaults))
+    elif rotation_property == 'rotation_axis_angle':
+        defaults = (0.0, 0.0, 1.0, 0.0)
+        angle_at_frame = lambda frame: abs(
+            _curve_components(fcurves, frame, defaults)[0])
+    else:
+        defaults = (0.0, 0.0, 0.0)
+        # For the deliberately small cleanup threshold, the Euler vector norm
+        # is a conservative approximation of the orientation's angular delta.
+        angle_at_frame = lambda frame: math.sqrt(sum(
+            component * component
+            for component in _curve_components(fcurves, frame, defaults)
+        ))
+
+    return all(
+        angle_at_frame(frame) <= threshold
+        for frame in _curve_frames(fcurves, start_frame, end_frame)
+    )
+
+
+def _interpolation_error(
+    property_name,
+    actual,
+    first,
+    second,
+    factor,
+):
+    if property_name == 'rotation_quaternion':
+        expected = _slerp_quaternion(first, second, factor)
+        return _quaternion_distance(actual, expected)
+    if property_name == 'rotation_axis_angle':
+        expected = _slerp_quaternion(
+            _axis_angle_quaternion(first),
+            _axis_angle_quaternion(second),
+            factor,
+        )
+        return _quaternion_distance(
+            _axis_angle_quaternion(actual), expected)
+
+    expected = tuple(
+        a + factor * (b - a)
+        for a, b in zip(first, second)
+    )
+    if property_name == 'rotation_euler':
+        angular_deltas = [
+            (value - target + math.pi) % (2.0 * math.pi) - math.pi
+            for value, target in zip(actual, expected)
+        ]
+        return math.sqrt(sum(delta * delta for delta in angular_deltas))
+    if property_name == 'scale':
+        return max(abs(value - target) for value, target in zip(actual, expected))
+    return math.sqrt(sum(
+        (value - target) ** 2
+        for value, target in zip(actual, expected)
+    ))
+
+
+def _simplified_sample_indices(property_name, frames, values, threshold):
+    if len(frames) <= 2:
+        return set(range(len(frames)))
+
+    kept_indices = {0, len(frames) - 1}
+    spans = [(0, len(frames) - 1)]
+    while spans:
+        first_index, last_index = spans.pop()
+        frame_span = frames[last_index] - frames[first_index]
+        if frame_span <= 0.0:
+            continue
+
+        largest_error = -1.0
+        largest_error_index = None
+        for sample_index in range(first_index + 1, last_index):
+            factor = (
+                (frames[sample_index] - frames[first_index]) / frame_span
+            )
+            error = _interpolation_error(
+                property_name,
+                values[sample_index],
+                values[first_index],
+                values[last_index],
+                factor,
+            )
+            if error > largest_error:
+                largest_error = error
+                largest_error_index = sample_index
+
+        if largest_error_index is not None and largest_error > threshold:
+            kept_indices.add(largest_error_index)
+            spans.append((first_index, largest_error_index))
+            spans.append((largest_error_index, last_index))
+
+    return kept_indices
+
+
+def _simplify_transform_curves(
+    property_name,
+    fcurves,
+    start_frame,
+    end_frame,
+    threshold,
+):
+    frames = sorted({
+        keyframe.co[0]
+        for fcurve in fcurves
+        for keyframe in fcurve.keyframe_points
+        if start_frame <= keyframe.co[0] <= end_frame
+    })
+    if len(frames) <= 2:
+        return 0
+    defaults = {
+        'location': (0.0, 0.0, 0.0),
+        'rotation_axis_angle': (0.0, 0.0, 1.0, 0.0),
+        'rotation_euler': (0.0, 0.0, 0.0),
+        'rotation_quaternion': (1.0, 0.0, 0.0, 0.0),
+        'scale': (1.0, 1.0, 1.0),
+    }[property_name]
+    values = [
+        tuple(_curve_components(fcurves, frame, defaults))
+        for frame in frames
+    ]
+    kept_indices = _simplified_sample_indices(
+        property_name, frames, values, threshold)
+    kept_frames = {frames[index] for index in kept_indices}
+
+    removed_count = 0
+    for fcurve in fcurves:
+        for keyframe in list(fcurve.keyframe_points):
+            if (
+                start_frame <= keyframe.co[0] <= end_frame
+                and keyframe.co[0] not in kept_frames
+            ):
+                fcurve.keyframe_points.remove(keyframe)
+                removed_count += 1
+        for keyframe in fcurve.keyframe_points:
+            if start_frame <= keyframe.co[0] <= end_frame:
+                keyframe.interpolation = 'LINEAR'
+        fcurve.update()
+    return removed_count
+
+
+def _remove_curves(action, fcurves):
+    for fcurve in list(fcurves):
+        _remove_action_fcurve(action, fcurve)
+    return len(fcurves)
+
+
+def _reset_transform_property(pose_bone, property_name):
+    if property_name == 'location':
+        pose_bone.location = (0.0, 0.0, 0.0)
+    elif property_name == 'scale':
+        pose_bone.scale = (1.0, 1.0, 1.0)
+    elif property_name == 'rotation_quaternion':
+        pose_bone.rotation_quaternion = (1.0, 0.0, 0.0, 0.0)
+    elif property_name == 'rotation_axis_angle':
+        pose_bone.rotation_axis_angle = (0.0, 0.0, 1.0, 0.0)
+    elif property_name == 'rotation_euler':
+        pose_bone.rotation_euler = (0.0, 0.0, 0.0)
+
+
+def _remove_clip_local_transform_curves(
+    action,
+    pose_bone,
+    start_frame,
+    end_frame,
+):
+    removed_count = 0
+    for property_name, fcurves in _bone_transform_curves(
+        action, pose_bone).items():
+        if not fcurves or not _curves_are_clip_local(
+            fcurves, start_frame, end_frame):
+            continue
+        removed_count += _remove_curves(action, fcurves)
+        _reset_transform_property(pose_bone, property_name)
+    return removed_count
+
+
+def _remove_ik_conflict_curves(
+    action,
+    rigify_rig,
+    start_frame,
+    end_frame,
+    profile_id=None,
+):
+    """Remove stale limb FK/tweak data when explicitly authoring in IK.
+
+    Mixamo stays on FK limbs, so nothing is cleared for that profile.
+    """
+    if profile_id == 'MIXAMO':
+        return 0
+    removed_count = 0
+    for pose_bone in rigify_rig.pose.bones:
+        if _is_limb_fk_or_tweak_control(pose_bone.name):
+            removed_count += _remove_clip_local_transform_curves(
+                action,
+                pose_bone,
+                start_frame,
+                end_frame,
+            )
+    return removed_count
+
+
+def _remove_torso_conflict_curves(
+    action,
+    rigify_rig,
+    start_frame,
+    end_frame,
+):
+    """Remove direct spine FK/tweak data in high-level torso mode."""
+    removed_count = 0
+    for pose_bone in rigify_rig.pose.bones:
+        if _is_spine_fk_or_tweak_control(pose_bone.name):
+            removed_count += _remove_clip_local_transform_curves(
+                action,
+                pose_bone,
+                start_frame,
+                end_frame,
+            )
+    return removed_count
+
+
+def _remove_finger_control_curves(
+    action,
+    rigify_rig,
+    start_frame,
+    end_frame,
+):
+    """Remove stale individual finger animation when finger baking is off."""
+    removed_count = 0
+    for pose_bone in rigify_rig.pose.bones:
+        if _is_finger_control(pose_bone.name):
+            removed_count += _remove_clip_local_transform_curves(
+                action,
+                pose_bone,
+                start_frame,
+                end_frame,
+            )
+    return removed_count
+
+
+def _key_ik_mode(action, rigify_rig, start_frame, end_frame, profile_id=None):
+    """Keep the baked action in the correct IK/FK mix after preview restore.
+
+    Mixamo always stays in FK (1.0) for all limbs.
+    """
+    if profile_id == 'MIXAMO':
+        value = 1.0
+    else:
+        value = 0.0
+
+    for pose_bone in rigify_rig.pose.bones:
+        if not isinstance(pose_bone.get(IK_FK_PROPERTY), float):
+            continue
+
+        data_path = f'["{IK_FK_PROPERTY}"]'
+        full_data_path = pose_bone.path_from_id(data_path)
+        for fcurve in _iter_action_fcurves(action):
+            if fcurve.data_path != full_data_path:
+                continue
+            for keyframe in list(fcurve.keyframe_points):
+                if start_frame <= keyframe.co[0] <= end_frame:
+                    fcurve.keyframe_points.remove(keyframe)
+
+        pose_bone[IK_FK_PROPERTY] = value
+        pose_bone.keyframe_insert(
+            data_path=data_path,
+            frame=start_frame,
+            group=pose_bone.name,
+        )
+        if end_frame != start_frame:
+            pose_bone.keyframe_insert(
+                data_path=data_path,
+                frame=end_frame,
+                group=pose_bone.name,
             )
 
-        context.scene.frame_set(context.scene.frame_current)
-        return {'FINISHED'}
-
-    @classmethod
-    def poll(cls, context):
-        obj = context.active_object
-        return (
-            obj and obj.type == 'ARMATURE' and obj.mode == 'POSE'
-            and obj.animation_data and obj.animation_data.action
-            and not _is_transform_running()
-        )
+        for fcurve in _iter_action_fcurves(action):
+            if fcurve.data_path != full_data_path:
+                continue
+            for keyframe in fcurve.keyframe_points:
+                if keyframe.co[0] in {start_frame, end_frame}:
+                    keyframe.interpolation = 'CONSTANT'
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# UI Panels
-# ─────────────────────────────────────────────────────────────────────────────
+def _clean_negligible_bake(
+    scene,
+    action,
+    rigify_rig,
+    control_names,
+    start_frame,
+    end_frame,
+):
+    """Remove neutral channels and reduce dense keys within error limits."""
+    removed_count = 0
+    for control_name in control_names:
+        pose_bone = rigify_rig.pose.bones.get(control_name)
+        if not pose_bone:
+            continue
 
-class LIVEOFFSET_PT_panel(Panel):
-    bl_label = "Live Offset"
-    bl_idname = "LIVEOFFSET_PT_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Transform Shortcuts"
+        curves_by_property = _bone_transform_curves(action, pose_bone)
+        for property_name, fcurves in curves_by_property.items():
+            if not fcurves or not _curves_are_clip_local(
+                fcurves, start_frame, end_frame):
+                continue
 
-    def draw(self, context):
-        layout = self.layout
-        obj = context.active_object
-        wm = context.window_manager
-
-        if not obj or obj.type != 'ARMATURE':
-            layout.label(text="Select an Armature", icon='ERROR')
-            return
-        if obj.mode != 'POSE':
-            layout.label(text="Switch to Pose Mode", icon='ERROR')
-            return
-        if not obj.animation_data or not obj.animation_data.action:
-            layout.label(text="No active Action", icon='ERROR')
-            return
-
-        selected = context.selected_pose_bones or []
-        if not selected:
-            layout.label(text="Select one or more bones", icon='INFO')
-            return
-
-        transforming = _is_transform_running()
-        settings = wm.live_offset_settings
-        pending = collect_offsets(context)
-
-        box = layout.box()
-        box.label(text=f"Selected: {len(selected)} bone(s)", icon='BONE_DATA')
-        if transforming:
-            box.label(text="Transforming… (offsets frozen)", icon='TIME')
-        elif not pending:
-            box.label(text="All offsets ≈ 0", icon='CHECKMARK')
-        else:
-            box.label(text=f"{len(pending)} channel(s) with offset", icon='MODIFIER')
-
-        # Mirror toggles for paste operations (like viewport mirror buttons)
-        mirror_box = layout.box()
-        mirror_box.label(text="Paste Mirror", icon='MOD_MIRROR')
-        mirror_box.enabled = not transforming
-        row = mirror_box.row(align=True)
-        row.prop(settings, "mirror_x", text="X", toggle=True)
-        row.prop(settings, "mirror_y", text="Y", toggle=True)
-        row.prop(settings, "mirror_z", text="Z", toggle=True)
-
-        bone = context.active_pose_bone
-        if bone:
-            row = layout.row()
-            row.label(text="Rotation Mode")
-            row.prop(bone, "rotation_mode", text="")
-
-            # ── Location Offset ──────────────────────────────────────────────
-            box = layout.box()
-            box.label(text="Location Offset")
-            box.enabled = not transforming
-            box.prop(settings, "loc_offset", text="")
-            row = box.row(align=True)
-            row.operator("liveoffset.copy_location", text="Copy", icon='COPYDOWN')
-            row.operator("liveoffset.paste_location", text="Paste", icon='PASTEDOWN')
-
-            # ── Rotation Offset ──────────────────────────────────────────────
-            box = layout.box()
-            box.enabled = not transforming
-            if bone.rotation_mode == 'QUATERNION':
-                box.label(text="Rotation Offset (Quaternion)")
-                row = box.row(align=True)
-                row.prop(settings, "rot_offset", index=0, text="W")
-                row.prop(settings, "rot_offset", index=1, text="X")
-                row = box.row(align=True)
-                row.prop(settings, "rot_offset", index=2, text="Y")
-                row.prop(settings, "rot_offset", index=3, text="Z")
-            elif bone.rotation_mode == 'AXIS_ANGLE':
-                box.label(text="Rotation Offset (Axis-Angle)")
-                box.prop(settings, "rot_offset", index=0, text="Angle")
-                row = box.row(align=True)
-                row.prop(settings, "rot_offset", index=1, text="X")
-                row.prop(settings, "rot_offset", index=2, text="Y")
-                row.prop(settings, "rot_offset", index=3, text="Z")
+            if property_name == 'location':
+                is_negligible = _location_is_negligible(
+                    fcurves,
+                    start_frame,
+                    end_frame,
+                    scene.udr_location_threshold,
+                )
+            elif property_name == 'scale':
+                is_negligible = _scale_is_negligible(
+                    fcurves,
+                    start_frame,
+                    end_frame,
+                    scene.udr_scale_threshold,
+                )
             else:
-                box.label(text="Rotation Offset (Euler)")
-                box.prop(settings, "rot_offset", index=0, text="X")
-                box.prop(settings, "rot_offset", index=1, text="Y")
-                box.prop(settings, "rot_offset", index=2, text="Z")
-            row = box.row(align=True)
-            row.operator("liveoffset.copy_rotation", text="Copy", icon='COPYDOWN')
-            row.operator("liveoffset.paste_rotation", text="Paste", icon='PASTEDOWN')
+                is_negligible = _rotation_is_negligible(
+                    property_name,
+                    fcurves,
+                    start_frame,
+                    end_frame,
+                    scene.udr_rotation_threshold,
+                )
 
-            # ── Scale Offset ─────────────────────────────────────────────────
-            box = layout.box()
-            box.label(text="Scale Offset")
-            box.enabled = not transforming
-            box.prop(settings, "scale_offset", text="")
-            row = box.row(align=True)
-            row.operator("liveoffset.copy_scale", text="Copy", icon='COPYDOWN')
-            row.operator("liveoffset.paste_scale", text="Paste", icon='PASTEDOWN')
+            if is_negligible:
+                removed_count += _remove_curves(action, fcurves)
+                _reset_transform_property(pose_bone, property_name)
+            else:
+                threshold = {
+                    'location': scene.udr_location_threshold,
+                    'scale': scene.udr_scale_threshold,
+                }.get(property_name, scene.udr_rotation_threshold)
+                removed_count += _simplify_transform_curves(
+                    property_name,
+                    fcurves,
+                    start_frame,
+                    end_frame,
+                    threshold,
+                )
 
-        layout.separator()
-        row = layout.row(align=True)
-        row.enabled = not transforming
-        row.operator("liveoffset.copy", text="Copy All Offsets", icon='COPYDOWN')
-        row.operator("liveoffset.paste", text="Paste All Offsets", icon='PASTEDOWN')
-
-        col = layout.column(align=True)
-        col.scale_y = 1.3
-        col.enabled = not transforming
-        col.operator("liveoffset.apply", text="Apply to All Keyframes", icon='CHECKMARK')
-        col.operator("liveoffset.apply_selected", text="Apply to Selected Keyframes", icon='RESTRICT_SELECT_OFF')
-
-        col.separator()
-        col.operator("liveoffset.apply_relative", text="Apply Relative Offset to All", icon='CON_TRANSLIKE')
-        col.operator("liveoffset.apply_relative_selected", text="Apply Relative Offset to Selected", icon='RESTRICT_SELECT_OFF')
-
-        row = layout.row(align=True)
-        row.enabled = not transforming
-        row.operator("liveoffset.reset", text="Reset", icon='LOOP_BACK')
-        row.operator("liveoffset.refresh", text="", icon='FILE_REFRESH')
+    return removed_count
 
 
-class TRANSFORMSHORTCUTS_PT_panel(Panel):
-    bl_label = "Transform Shortcuts"
-    bl_idname = "TRANSFORMSHORTCUTS_PT_panel"
-    bl_space_type = 'VIEW_3D'
-    bl_region_type = 'UI'
-    bl_category = "Transform Shortcuts"
+def add_constraints(scene):
+    source_rig = scene.udr_source_rig
+    rigify_rig = scene.udr_rigify_rig
+    if not source_rig or not rigify_rig:
+        raise ValueError('Both source and Rigify armatures must be selected.')
 
-    def draw(self, context):
-        layout = self.layout
-        obj = context.active_object
-        wm = context.window_manager
+    _validate_authoring_controls(scene, source_rig, rigify_rig)
 
-        if not obj or obj.type != 'ARMATURE':
-            layout.label(text="Select an Armature", icon='ERROR')
-            return
-        if obj.mode != 'POSE':
-            layout.label(text="Switch to Pose Mode", icon='ERROR')
-            return
+    previous_object, previous_mode = ensure_pose_mode(rigify_rig)
 
-        bone = context.active_pose_bone
-        if not bone:
-            layout.label(text="Select a bone", icon='INFO')
-            return
+    try:
+        # Rebuilding an enabled preview (for example after changing drive mode)
+        # must not overwrite the user's original IK/FK state with the temporary
+        # state imposed by the previous preview.
+        if not scene.udr_saved_ikfk_state:
+            scene.udr_saved_ikfk_state = json.dumps(
+                _save_ikfk_state(rigify_rig))
+        _set_drive_mode(rigify_rig, scene.udr_ik_driven, scene.udr_profile)
+        _suspend_target_action_for_preview(scene, rigify_rig)
+        _clear_existing_constraints(rigify_rig)
+        _clear_offset_helpers()
 
-        transforming = _is_transform_running()
-        settings = wm.transform_shortcuts_settings
+        for mapping in get_profile_mappings(scene, rigify_rig):
+            rigify_bone = rigify_rig.pose.bones.get(mapping['control'])
+            if not rigify_bone:
+                continue
 
-        box = layout.box()
-        box.label(text=f"Active: {bone.name}", icon='BONE_DATA')
-        box.label(text=f"Frame: {context.scene.frame_current}", icon='TIME')
-        if transforming:
-            box.label(text="Transforming… (values frozen)", icon='TIME')
+            source_bone_name = _resolve_source_bone_name(
+                source_rig, mapping['source'])
+            if not source_bone_name:
+                continue
 
-        row = layout.row()
-        row.label(text="Rotation Mode")
-        row.prop(bone, "rotation_mode", text="")
+            offset_target = _create_offset_helpers(
+                source_rig, rigify_rig, source_bone_name, rigify_bone.name)
+            if not offset_target:
+                continue
 
-        # ── Location ─────────────────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Location")
-        box.enabled = not transforming
-        box.prop(settings, "location", text="")
-        row = box.row(align=True)
-        row.operator("transformshortcuts.copy_location", text="Copy", icon='COPYDOWN')
-        row.operator("transformshortcuts.paste_location", text="Paste", icon='PASTEDOWN')
+            if mapping['type'] == COPY_ROTATION:
+                _add_copy_rotation_constraint(
+                    offset_target, rigify_bone, mapping)
+            elif mapping['type'] == COPY_LOCATION:
+                _add_copy_location_constraint(
+                    offset_target, rigify_bone, mapping)
+            else:
+                # ROOT links also use a rest-relative COPY_TRANSFORMS chain.
+                # This mirrors UE2Rigify and keeps a static source object from
+                # resetting or animating the Rigify master controls.
+                _add_copy_transforms_constraint(offset_target, rigify_bone)
+    finally:
+        restore_mode(previous_object, previous_mode)
 
-        # ── Rotation ─────────────────────────────────────────────────────────
-        box = layout.box()
-        box.enabled = not transforming
-        if bone.rotation_mode == 'QUATERNION':
-            box.label(text="Rotation (Quaternion)")
-            row = box.row(align=True)
-            row.prop(settings, "rotation", index=0, text="W")
-            row.prop(settings, "rotation", index=1, text="X")
-            row = box.row(align=True)
-            row.prop(settings, "rotation", index=2, text="Y")
-            row.prop(settings, "rotation", index=3, text="Z")
-        elif bone.rotation_mode == 'AXIS_ANGLE':
-            box.label(text="Rotation (Axis-Angle)")
-            box.prop(settings, "rotation", index=0, text="Angle")
-            row = box.row(align=True)
-            row.prop(settings, "rotation", index=1, text="X")
-            row.prop(settings, "rotation", index=2, text="Y")
-            row.prop(settings, "rotation", index=3, text="Z")
+
+def remove_constraints(scene):
+    rigify_rig = scene.udr_rigify_rig
+    if not rigify_rig:
+        raise ValueError('A Rigify armature must be selected.')
+
+    previous_object, previous_mode = ensure_pose_mode(rigify_rig)
+    try:
+        _clear_existing_constraints(rigify_rig)
+        _clear_offset_helpers()
+        _restore_ikfk_state(rigify_rig, scene.udr_saved_ikfk_state)
+        _restore_target_action_after_preview(scene, rigify_rig)
+        scene.udr_saved_ikfk_state = ''
+    finally:
+        restore_mode(previous_object, previous_mode)
+
+
+def bake_to_rigify(scene):
+    source_rig = scene.udr_source_rig
+    rigify_rig = scene.udr_rigify_rig
+    source_action = scene.udr_source_action
+
+    if not source_rig or not rigify_rig:
+        raise ValueError('Both source and Rigify armatures must be selected.')
+    if not source_action:
+        raise ValueError('A source action must be selected.')
+
+    _validate_authoring_controls(scene, source_rig, rigify_rig)
+
+    if source_rig.animation_data is None:
+        source_rig.animation_data_create()
+    if rigify_rig.animation_data is None:
+        rigify_rig.animation_data_create()
+
+    source_animation_data_block = source_rig.animation_data
+    rigify_animation_data_block = rigify_rig.animation_data
+    if source_animation_data_block is None or rigify_animation_data_block is None:
+        raise ValueError('Source and Rigify rigs must both support animation data.')
+
+    previous_source_action = source_animation_data_block.action
+    source_animation_data_block.action = source_action
+
+    previous_target_action = rigify_animation_data_block.action
+
+    previous_object, previous_mode = ensure_pose_mode(rigify_rig)
+    collection_state, bone_state = _ensure_all_bones_visible(rigify_rig)
+    removed_curve_count = 0
+
+    try:
+        target_action = _get_or_create_target_action(scene, source_action, rigify_rig)
+        overwrite = bool(scene.udr_rigify_action)
+        bake_control_names = _get_bake_control_names(scene, rigify_rig)
+        _select_bake_controls(rigify_rig, scene)
+
+        start_frame, end_frame = map(int, source_action.frame_range)
+
+        bpy.ops.nla.bake(
+            frame_start=start_frame,
+            frame_end=end_frame,
+            step=scene.udr_keyframe_step,
+            only_selected=True,
+            visual_keying=True,
+            clear_constraints=False,
+            use_current_action=overwrite,
+            bake_types={'POSE'}
+        )
+
+        rigify_animation_data_block.action = target_action
+
+        if scene.udr_keyframe_step > 1:
+            _bake_boundary_frames(start_frame, end_frame)
+
+        if scene.udr_torso_controls and scene.udr_profile != 'MIXAMO':
+            removed_curve_count += _remove_torso_conflict_curves(
+                target_action,
+                rigify_rig,
+                start_frame,
+                end_frame,
+            )
+
+        if not scene.udr_bake_fingers:
+            removed_curve_count += _remove_finger_control_curves(
+                target_action,
+                rigify_rig,
+                start_frame,
+                end_frame,
+            )
+
+        if scene.udr_ik_driven:
+            removed_curve_count += _remove_ik_conflict_curves(
+                target_action,
+                rigify_rig,
+                start_frame,
+                end_frame,
+                scene.udr_profile,
+            )
+            _key_ik_mode(
+                target_action,
+                rigify_rig,
+                start_frame,
+                end_frame,
+                scene.udr_profile,
+            )
+
+        if scene.udr_clean_bake:
+            removed_curve_count += _clean_negligible_bake(
+                scene,
+                target_action,
+                rigify_rig,
+                bake_control_names,
+                start_frame,
+                end_frame,
+            )
+
+        # The baked result should remain active when Retarget is turned off,
+        # rather than restoring the action that was muted for the preview.
+        scene.udr_preview_action = target_action
+
+        if not scene.udr_rigify_action:
+            scene.udr_rigify_action = rigify_animation_data_block.action
+    finally:
+        _restore_visibility(rigify_rig, collection_state, bone_state)
+        restore_mode(previous_object, previous_mode)
+        source_animation_data_block.action = previous_source_action
+        rigify_animation_data_block.action = previous_target_action or rigify_animation_data_block.action
+
+    return removed_curve_count
+
+
+class UDR_OT_retarget(bpy.types.Operator):
+    bl_idname = 'udr.retarget'
+    bl_label = 'Retarget'
+
+    def execute(self, context):
+        try:
+            add_constraints(context.scene)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class UDR_OT_untarget(bpy.types.Operator):
+    bl_idname = 'udr.untarget'
+    bl_label = 'Untarget'
+
+    def execute(self, context):
+        try:
+            remove_constraints(context.scene)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+class UDR_OT_bake_fk(bpy.types.Operator):
+    bl_idname = 'udr.bake_fk'
+    bl_label = 'Bake FK'
+
+    def invoke(self, context, event):
+        if context.scene.udr_rigify_action:
+            return context.window_manager.invoke_confirm(self, event)
+        return self.execute(context)
+
+    def execute(self, context):
+        try:
+            removed_curve_count = bake_to_rigify(context.scene)
+        except ValueError as error:
+            self.report({'ERROR'}, str(error))
+            return {'CANCELLED'}
+        if removed_curve_count:
+            self.report(
+                {'INFO'},
+                (
+                    f'Bake complete; removed {removed_curve_count} '
+                    'redundant curves/keys.'
+                ),
+            )
+        return {'FINISHED'}
+
+
+class UDR_OT_toggle_retarget(bpy.types.Operator):
+    bl_idname = 'udr.toggle_retarget'
+    bl_label = 'Toggle Retarget'
+
+    def execute(self, context):
+        scene = context.scene
+        if scene.udr_enabled:
+            bpy.ops.udr.retarget('INVOKE_DEFAULT')
         else:
-            box.label(text="Rotation (Euler)")
-            box.prop(settings, "rotation", index=0, text="X")
-            box.prop(settings, "rotation", index=1, text="Y")
-            box.prop(settings, "rotation", index=2, text="Z")
-        row = box.row(align=True)
-        row.operator("transformshortcuts.copy_rotation", text="Copy", icon='COPYDOWN')
-        row.operator("transformshortcuts.paste_rotation", text="Paste", icon='PASTEDOWN')
-
-        # ── Scale ────────────────────────────────────────────────────────────
-        box = layout.box()
-        box.label(text="Scale")
-        box.enabled = not transforming
-        box.prop(settings, "scale", text="")
-        row = box.row(align=True)
-        row.operator("transformshortcuts.copy_scale", text="Copy", icon='COPYDOWN')
-        row.operator("transformshortcuts.paste_scale", text="Paste", icon='PASTEDOWN')
-
-        layout.separator()
-        row = layout.row(align=True)
-        row.scale_y = 1.4
-        row.enabled = not transforming
-        row.operator("transformshortcuts.copy", text="Copy All", icon='COPYDOWN')
-        row.operator("transformshortcuts.paste", text="Paste All", icon='PASTEDOWN')
-        row = layout.row()
-        row.enabled = not transforming
-        row.operator("transformshortcuts.refresh", text="Refresh", icon='FILE_REFRESH')
+            bpy.ops.udr.untarget('INVOKE_DEFAULT')
+        return {'FINISHED'}
 
 
-class ANIMSHORTCUTS_PT_panel(Panel):
-    bl_label = "Anim Shortcuts"
-    bl_idname = "ANIMSHORTCUTS_PT_panel"
+class UDR_PT_panel(bpy.types.Panel):
+    bl_label = 'Retarget Source -> Rigify'
+    bl_idname = 'VIEW3D_PT_udr_panel'
     bl_space_type = 'VIEW_3D'
     bl_region_type = 'UI'
-    bl_category = "Anim Shortcuts"
+    bl_category = 'Item'
+    bl_order = 100
 
     def draw(self, context):
+        scene = context.scene
         layout = self.layout
-        obj = context.active_object
-        settings = context.window_manager.anim_shortcuts_settings
 
-        if not obj or obj.type != 'ARMATURE':
-            layout.label(text="Select an Armature", icon='ERROR')
+        required_properties = [
+            'udr_source_rig',
+            'udr_source_action',
+            'udr_rigify_rig',
+            'udr_rigify_action',
+            'udr_profile',
+            'udr_torso_controls',
+            'udr_bake_fingers',
+            'udr_ik_driven',
+            'udr_keyframe_step',
+            'udr_clean_bake',
+            'udr_location_threshold',
+            'udr_rotation_threshold',
+            'udr_scale_threshold',
+            'udr_enabled',
+        ]
+        if not all(hasattr(scene, property_name) for property_name in required_properties):
+            layout.label(text='Addon registration is incomplete.', icon='ERROR')
             return
-        if obj.mode != 'POSE':
-            layout.label(text="Switch to Pose Mode", icon='ERROR')
-            return
-        if not obj.animation_data or not obj.animation_data.action:
-            layout.label(text="No active Action", icon='ERROR')
-            return
 
-        # Auto-suggest half length when the preferred value is still the default
-        # and we have a sensible action length
-        total = get_action_total_length(context)
-        if total >= 16 and settings.prefer_period == 30:
-            # only auto-set once (when still at factory default)
-            settings.prefer_period = max(8, int(round(total / 2)))
+        source_box = layout.box()
+        source_box.label(text='Source')
+        source_box.prop(scene, 'udr_source_rig', text='Rig')
+        source_box.prop(scene, 'udr_source_action', text='Action')
 
-        box = layout.box()
-        box.label(text="Loop Detection (Walk Cycle)", icon='LOOP_FORWARDS')
+        target_box = layout.box()
+        target_box.label(text='Rigify Target')
+        target_box.prop(scene, 'udr_rigify_rig', text='Rig')
+        target_box.prop(scene, 'udr_rigify_action', text='Action')
 
-        col = box.column(align=True)
-        col.prop(settings, "prefer_period")
-        row = col.row(align=True)
-        row.operator("animshortcuts.set_prefer_half", text="Set to Half Length", icon='ARROW_LEFTRIGHT')
-        if total > 0:
-            row = col.row()
-            row.scale_y = 0.8
-            row.label(text=f"Action length ≈ {total} frames", icon='TIME')
+        layout.prop(scene, 'udr_profile', text='Profile')
 
-        col.separator()
-        col.prop(settings, "loop_tolerance", slider=True)
-        col.prop(settings, "compare_mode")
-        col.prop(settings, "ignore_root_location")
+        options_box = layout.box()
+        options_box.label(text='Authoring Options')
+        options_box.prop(scene, 'udr_torso_controls')
+        options_box.prop(scene, 'udr_bake_fingers')
+        options_box.prop(scene, 'udr_ik_driven')
+        options_box.prop(scene, 'udr_keyframe_step')
+        options_box.prop(scene, 'udr_clean_bake')
+        if scene.udr_clean_bake:
+            threshold_column = options_box.column(align=True)
+            threshold_column.prop(scene, 'udr_location_threshold')
+            threshold_column.prop(scene, 'udr_rotation_threshold')
+            threshold_column.prop(scene, 'udr_scale_threshold')
 
-        layout.separator()
-
-        col = layout.column(align=True)
-        col.scale_y = 1.4
-        col.operator("animshortcuts.detect_loop", text="Detect Loop", icon='TIME')
-        col.operator("animshortcuts.detect_truncate_loop", text="Detect and Truncate Loop", icon='TRASH')
-        col.operator("animshortcuts.homogenise", text="Homogenise Animation", icon='MOD_SMOOTH')
-
-        layout.separator()
-        info = layout.column(align=True)
-        info.scale_y = 0.8
-        info.label(text="Prefer Period ≈ length of ONE walk cycle", icon='INFO')
-        info.label(text="Homogenise forces later cycles to match the first", icon='INFO')
-
-        # ── Quaternion Homogenisation ───────────────────────────────────────
-        layout.separator()
-        box = layout.box()
-        box.label(text="Quaternion Homogenisation", icon='CON_ROTLIKE')
-        col = box.column(align=True)
-        col.scale_y = 1.3
-        col.operator(
-            "animshortcuts.homogenise_rotation",
-            text="Homogenise Rotation (Active)",
-            icon='MOD_SMOOTH',
+        row = layout.row(align=True)
+        row.prop(scene, 'udr_enabled', toggle=True, icon='CONSTRAINT')
+        bake_col = row.column(align=True)
+        bake_col.operator(
+            'udr.bake_fk',
+            text='Bake IK' if scene.udr_ik_driven else 'Bake FK',
+            icon='CAMERA_DATA',
         )
-        col.separator()
-        col.prop(settings, "homogenize_target_action", text="Target")
-        col.operator(
-            "animshortcuts.homogenise_rotation_to_source",
-            text="Homogenise Target to Source",
-            icon='UV_SYNC_SELECT',
-        )
-        box.label(
-            text="Flips q ↔ –q so interpolation never takes the long spin",
-            icon='INFO',
-        )
+        bake_col.enabled = scene.udr_enabled
 
-
-        # ── Character Centering ─────────────────────────────────────────────
-        layout.separator()
-        box = layout.box()
-        box.label(text="Character Centering", icon='PIVOT_CURSOR')
-        col = box.column(align=True)
-        col.scale_y = 1.3
-        col.operator(
-            "animshortcuts.center_character",
-            text="Center Character (Zero X/Y)",
-            icon='PIVOT_CURSOR',
-        )
-        box.label(
-            text="Centers torso/hips (Rigify controls only, clean keys). Z free.",
-            icon='INFO',
-        )
-
-        # ── Clear Keyframes by Type ─────────────────────────────────────────
-        layout.separator()
-        box = layout.box()
-        box.label(text="Clear Keyframes by Type", icon='KEYFRAME')
-        col = box.column(align=True)
-        col.scale_y = 1.2
-        col.operator(
-            "animshortcuts.clear_tweak_keys",
-            text="Clear Tweak Keyframes",
-            icon='TRASH',
-        )
-        col.operator(
-            "animshortcuts.clear_fk_keys",
-            text="Clear FK Keyframes",
-            icon='TRASH',
-        )
-        col.operator(
-            "animshortcuts.clear_finger_keys",
-            text="Clear Finger Keyframes",
-            icon='TRASH',
-        )
-        col.operator(
-            "animshortcuts.clear_finger_master_keys",
-            text="Clear Finger Master Keyframes",
-            icon='TRASH',
-        )
-        box.label(
-            text="Deletes keys on tweak / FK / finger / finger-master bones.",
-            icon='INFO',
-        )
-
-        # ── Copy Keyframes to another Action ────────────────────────────────
-        layout.separator()
-        box = layout.box()
-        box.label(text="Copy Keyframes to Action", icon='ACTION')
-        box.prop(settings, "target_action", text="")
-        row = box.row()
-        row.scale_y = 1.3
-        row.operator(
-            "animshortcuts.copy_bones_to_action",
-            text="Copy Selected Bones Keyframes",
-            icon='COPYDOWN',
-        )
-        box.label(
-            text="Copies keys of selected bones; non-overlapping target keys are kept",
-            icon='INFO',
-        )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Registration
-# ─────────────────────────────────────────────────────────────────────────────
 
 classes = (
-    LIVEOFFSET_PG_settings,
-    TRANSFORMSHORTCUTS_PG_settings,
-    ANIMSHORTCUTS_PG_settings,
-    LIVEOFFSET_OT_apply,
-    LIVEOFFSET_OT_apply_selected,
-    LIVEOFFSET_OT_apply_relative,
-    LIVEOFFSET_OT_apply_relative_selected,
-    LIVEOFFSET_OT_refresh,
-    LIVEOFFSET_OT_reset,
-    LIVEOFFSET_OT_copy,
-    LIVEOFFSET_OT_paste,
-    LIVEOFFSET_OT_copy_location,
-    LIVEOFFSET_OT_paste_location,
-    LIVEOFFSET_OT_copy_rotation,
-    LIVEOFFSET_OT_paste_rotation,
-    LIVEOFFSET_OT_copy_scale,
-    LIVEOFFSET_OT_paste_scale,
-    TRANSFORMSHORTCUTS_OT_copy,
-    TRANSFORMSHORTCUTS_OT_paste,
-    TRANSFORMSHORTCUTS_OT_refresh,
-    TRANSFORMSHORTCUTS_OT_copy_location,
-    TRANSFORMSHORTCUTS_OT_paste_location,
-    TRANSFORMSHORTCUTS_OT_copy_rotation,
-    TRANSFORMSHORTCUTS_OT_paste_rotation,
-    TRANSFORMSHORTCUTS_OT_copy_scale,
-    TRANSFORMSHORTCUTS_OT_paste_scale,
-    ANIMSHORTCUTS_OT_set_prefer_half,
-    ANIMSHORTCUTS_OT_detect_loop,
-    ANIMSHORTCUTS_OT_detect_truncate_loop,
-    ANIMSHORTCUTS_OT_homogenise,
-    ANIMSHORTCUTS_OT_homogenise_rotation,
-    ANIMSHORTCUTS_OT_homogenise_rotation_to_source,
-    ANIMSHORTCUTS_OT_copy_bones_to_action,
-    ANIMSHORTCUTS_OT_center_character,
-    ANIMSHORTCUTS_OT_clear_tweak_keys,
-    ANIMSHORTCUTS_OT_clear_fk_keys,
-    ANIMSHORTCUTS_OT_clear_finger_keys,
-    ANIMSHORTCUTS_OT_clear_finger_master_keys,
-    LIVEOFFSET_PT_panel,
-    TRANSFORMSHORTCUTS_PT_panel,
-    ANIMSHORTCUTS_PT_panel,
+    UDR_OT_retarget,
+    UDR_OT_untarget,
+    UDR_OT_bake_fk,
+    UDR_OT_toggle_retarget,
+    UDR_PT_panel,
 )
 
 
-def register():
-    for cls in classes:
+@bpy.app.handlers.persistent
+def _rebuild_enabled_retargets(_unused=None):
+    """Replace constraints saved by an older add-on version after loading."""
+    scenes = getattr(bpy.data, 'scenes', None)
+    if scenes is None:
+        return
+
+    for scene in scenes:
+        if not getattr(scene, 'udr_enabled', False):
+            continue
         try:
-            bpy.utils.register_class(cls)
-        except ValueError:
-            bpy.utils.unregister_class(cls)
-            bpy.utils.register_class(cls)
+            add_constraints(scene)
+        except Exception as error:
+            print(
+                f'Direct Retarget: could not rebuild scene '
+                f'{scene.name!r}: {error}'
+            )
 
-    if not hasattr(bpy.types.WindowManager, "live_offset_settings"):
-        bpy.types.WindowManager.live_offset_settings = bpy.props.PointerProperty(type=LIVEOFFSET_PG_settings)
-    if not hasattr(bpy.types.WindowManager, "transform_shortcuts_settings"):
-        bpy.types.WindowManager.transform_shortcuts_settings = bpy.props.PointerProperty(type=TRANSFORMSHORTCUTS_PG_settings)
-    if not hasattr(bpy.types.WindowManager, "anim_shortcuts_settings"):
-        bpy.types.WindowManager.anim_shortcuts_settings = bpy.props.PointerProperty(type=ANIMSHORTCUTS_PG_settings)
 
-    if _on_depsgraph_update not in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.append(_on_depsgraph_update)
+def _deferred_rebuild_enabled_retargets():
+    """Run the initial rebuild after Blender releases restricted data access."""
+    if not hasattr(bpy.data, 'scenes'):
+        return 0.1
+    _rebuild_enabled_retargets()
+    return None
+
+
+def register():
+    for addon_class in classes:
+        bpy.utils.register_class(addon_class)
+
+    bpy.types.Scene.udr_source_rig = bpy.props.PointerProperty(
+        name='Source Rig',
+        type=bpy.types.Object,
+        poll=armature_poll,
+        update=source_rig_update
+    )
+    bpy.types.Scene.udr_source_action = bpy.props.PointerProperty(
+        name='Source Action',
+        type=bpy.types.Action,
+        poll=action_poll
+    )
+    bpy.types.Scene.udr_rigify_rig = bpy.props.PointerProperty(
+        name='Rigify Rig',
+        type=bpy.types.Object,
+        poll=armature_poll,
+        update=rigify_rig_update
+    )
+    bpy.types.Scene.udr_rigify_action = bpy.props.PointerProperty(
+        name='Rigify Action',
+        type=bpy.types.Action,
+        poll=action_poll
+    )
+    bpy.types.Scene.udr_profile = bpy.props.EnumProperty(
+        name='Profile',
+        items=PROFILE_ITEMS,
+        default='UE5_MANNY',
+        update=retarget_settings_update,
+    )
+    bpy.types.Scene.udr_torso_controls = bpy.props.BoolProperty(
+        name='High-Level Torso Controls',
+        description=(
+            'Author the spine on torso, hips, and chest instead of individual '
+            'spine FK and tweak controls'
+        ),
+        default=False,
+        update=retarget_settings_update,
+    )
+    bpy.types.Scene.udr_bake_fingers = bpy.props.BoolProperty(
+        name='Include Finger FKs',
+        description=(
+            'Add animation to individual thumb and finger FK controls'
+        ),
+        default=True,
+        update=retarget_settings_update,
+    )
+    bpy.types.Scene.udr_ik_driven = bpy.props.BoolProperty(
+        name='IK Driven Limbs',
+        description=(
+            'Author arms and legs with Rigify IK end effectors and pole '
+            'controls instead of competing limb FK and tweak controls'
+        ),
+        default=False,
+        update=retarget_settings_update,
+    )
+    bpy.types.Scene.udr_keyframe_step = bpy.props.IntProperty(
+        name='Keyframe Step',
+        description=(
+            'Number of frames to skip forward while baking; higher values '
+            'produce fewer keyframes. The first and last frames are always '
+            'kept so looping stays seamless'
+        ),
+        default=1,
+        min=1,
+        soft_max=10,
+    )
+    bpy.types.Scene.udr_clean_bake = bpy.props.BoolProperty(
+        name='Skip Negligible Motion',
+        description=(
+            'Remove neutral transform channels and reduce dense baked keys '
+            'while staying within the configured error thresholds'
+        ),
+        default=False,
+    )
+    bpy.types.Scene.udr_location_threshold = bpy.props.FloatProperty(
+        name='Max Location Error',
+        description='Maximum location error allowed while cleaning the bake',
+        default=0.001,
+        min=0.0,
+        soft_max=0.1,
+        precision=4,
+        subtype='DISTANCE',
+    )
+    bpy.types.Scene.udr_rotation_threshold = bpy.props.FloatProperty(
+        name='Max Rotation Error',
+        description='Maximum angular error allowed while cleaning the bake',
+        default=math.radians(0.1),
+        min=0.0,
+        soft_max=math.radians(10.0),
+        subtype='ANGLE',
+    )
+    bpy.types.Scene.udr_scale_threshold = bpy.props.FloatProperty(
+        name='Max Scale Error',
+        description='Maximum scale error allowed while cleaning the bake',
+        default=0.001,
+        min=0.0,
+        soft_max=0.1,
+        precision=4,
+    )
+    bpy.types.Scene.udr_enabled = bpy.props.BoolProperty(
+        name='Retarget',
+        description='Enable or disable direct retarget constraints.',
+        default=False,
+        update=lambda self, context: bpy.ops.udr.toggle_retarget() and None
+    )
+    bpy.types.Scene.udr_preview_action = bpy.props.PointerProperty(
+        type=bpy.types.Action
+    )
+    bpy.types.Scene.udr_saved_ikfk_state = bpy.props.StringProperty(default='')
+
+    if _rebuild_enabled_retargets not in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.append(_rebuild_enabled_retargets)
+    if hasattr(bpy.data, 'scenes'):
+        _rebuild_enabled_retargets()
+    elif not bpy.app.timers.is_registered(_deferred_rebuild_enabled_retargets):
+        bpy.app.timers.register(
+            _deferred_rebuild_enabled_retargets,
+            first_interval=0.0,
+        )
 
 
 def unregister():
-    if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
-        bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
+    if _rebuild_enabled_retargets in bpy.app.handlers.load_post:
+        bpy.app.handlers.load_post.remove(_rebuild_enabled_retargets)
+    if bpy.app.timers.is_registered(_deferred_rebuild_enabled_retargets):
+        bpy.app.timers.unregister(_deferred_rebuild_enabled_retargets)
 
-    for attr in ("live_offset_settings", "transform_shortcuts_settings", "anim_shortcuts_settings"):
-        if hasattr(bpy.types.WindowManager, attr):
-            delattr(bpy.types.WindowManager, attr)
+    del bpy.types.Scene.udr_saved_ikfk_state
+    del bpy.types.Scene.udr_preview_action
+    del bpy.types.Scene.udr_enabled
+    del bpy.types.Scene.udr_scale_threshold
+    del bpy.types.Scene.udr_rotation_threshold
+    del bpy.types.Scene.udr_location_threshold
+    del bpy.types.Scene.udr_clean_bake
+    del bpy.types.Scene.udr_keyframe_step
+    del bpy.types.Scene.udr_ik_driven
+    del bpy.types.Scene.udr_bake_fingers
+    del bpy.types.Scene.udr_torso_controls
+    del bpy.types.Scene.udr_profile
+    del bpy.types.Scene.udr_rigify_action
+    del bpy.types.Scene.udr_rigify_rig
+    del bpy.types.Scene.udr_source_action
+    del bpy.types.Scene.udr_source_rig
 
-    for cls in reversed(classes):
-        try:
-            bpy.utils.unregister_class(cls)
-        except RuntimeError:
-            pass
-
-
-if __name__ == "__main__":
-    register()
+    for addon_class in reversed(classes):
+        bpy.utils.unregister_class(addon_class)
