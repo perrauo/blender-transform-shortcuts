@@ -3983,6 +3983,193 @@ class ANIMSHORTCUTS_OT_grt_set_baked_name(Operator):
         self.report({"INFO"}, f"Set local baked name on {count} entry(ies)")
         return {"FINISHED"}
 
+class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
+    """Generate a clean Game Rig safely.
+    Clears all constraints BEFORE deleting non-deform bones.
+    This prevents the incomplete / broken state that the standard
+    Game Rig Tools Generate can leave on complex custom rigs."""
+    bl_idname = "animshortcuts.generate_custom_game_rig"
+    bl_label = "Generate Custom Game Rig"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    hierarchy_mode: EnumProperty(
+        name="Hierarchy",
+        items=[
+            ('KEEP_EXISTING', "Keep Existing", "Keep current parent hierarchy"),
+            ('FLAT', "Flat", "Unparent everything"),
+            ('RIGIFY', "Rigify Fix", "Try to fix Rigify-style hierarchy"),
+        ],
+        default='KEEP_EXISTING',
+    )
+    constraint_type: EnumProperty(
+        name="Constraint",
+        items=[
+            ('LOTROT', "Loc + Rot", "Copy Location + Copy Rotation"),
+            ('TRANSFORM', "Copy Transforms", "Full Copy Transforms"),
+        ],
+        default='LOTROT',
+    )
+    disconnect_bones: BoolProperty(name="Disconnect Bones", default=True)
+    remove_bbone: BoolProperty(name="Remove BBone", default=True)
+    bind_meshes: BoolProperty(name="Bind Meshes to Game Rig", default=True)
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_props_dialog(self, width=360)
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "hierarchy_mode")
+        layout.prop(self, "constraint_type")
+        layout.prop(self, "disconnect_bones")
+        layout.prop(self, "remove_bbone")
+        layout.prop(self, "bind_meshes")
+        layout.separator()
+        box = layout.box()
+        box.label(text="Safe generation order:", icon='INFO')
+        box.label(text="1. Clear all constraints first")
+        box.label(text="2. Delete non-deform bones")
+        box.label(text="3. Add clean inter-armature constraints")
+
+    def execute(self, context):
+        if not _grt_available(context):
+            self.report({'ERROR'}, "Game Rig Tools is not loaded")
+            return {'CANCELLED'}
+
+        scn = context.scene
+        settings = scn.GRT_Action_Bakery_Global_Settings
+        control = settings.Source_Armature
+
+        if not control or control.type != 'ARMATURE':
+            self.report({'ERROR'}, "Set a valid Control Rig in the Game Rig Tools panel first")
+            return {'CANCELLED'}
+
+        # 1. Get or create the game rig
+        game_rig = settings.Target_Armature
+
+        if not game_rig or game_rig == control:
+            game_rig = control.copy()
+            game_rig.name = control.name + "_deform"
+            game_rig.data = control.data.copy()
+            game_rig.data.name = game_rig.name
+            context.collection.objects.link(game_rig)
+            settings.Target_Armature = game_rig
+        else:
+            if game_rig.data == control.data:
+                game_rig.data = control.data.copy()
+                game_rig.data.name = game_rig.name
+
+        game_rig.hide_set(False)
+        game_rig.hide_viewport = False
+        control.hide_set(False)
+        control.hide_viewport = False
+
+        # 2. CRITICAL – clear ALL constraints FIRST
+        bpy.ops.object.mode_set(mode='OBJECT')
+        bpy.ops.object.select_all(action='DESELECT')
+        game_rig.select_set(True)
+        context.view_layer.objects.active = game_rig
+
+        bpy.ops.object.mode_set(mode='POSE')
+
+        for pbone in game_rig.pose.bones:
+            while pbone.constraints:
+                pbone.constraints.remove(pbone.constraints[0])
+            pbone.custom_shape = None
+            pbone.lock_location = (False, False, False)
+            pbone.lock_rotation = (False, False, False)
+            pbone.lock_rotation_w = False
+            pbone.lock_scale = (False, False, False)
+
+        game_rig.animation_data_clear()
+        if game_rig.data.animation_data:
+            game_rig.data.animation_data_clear()
+
+        # 3. Edit mode – hierarchy + remove non-deform bones
+        bpy.ops.object.mode_set(mode='EDIT')
+        edit_bones = game_rig.data.edit_bones
+
+        if self.hierarchy_mode == 'FLAT':
+            for bone in edit_bones:
+                bone.parent = None
+        elif self.hierarchy_mode == 'RIGIFY':
+            for bone in list(edit_bones):
+                if bone.use_deform and bone.parent and not bone.parent.use_deform:
+                    p = bone.parent
+                    while p:
+                        if p.use_deform:
+                            bone.parent = p
+                            break
+                        def_name = p.name.replace("ORG-", "DEF-").replace("MCH-", "DEF-")
+                        candidate = edit_bones.get(def_name)
+                        if candidate and candidate.use_deform:
+                            bone.parent = candidate
+                            break
+                        p = p.parent
+
+        if self.disconnect_bones:
+            for bone in edit_bones:
+                bone.use_connect = False
+
+        for bone in edit_bones:
+            bone.use_inherit_rotation = True
+            bone.inherit_scale = 'FULL'
+            bone.use_local_location = True
+            if self.remove_bbone:
+                bone.bbone_segments = 1
+
+        # Collection
+        while len(game_rig.data.collections) > 0:
+            game_rig.data.collections.remove(game_rig.data.collections[0])
+        deform_coll = game_rig.data.collections.new("Deform")
+        for bone in edit_bones:
+            deform_coll.assign(bone)
+        deform_coll.is_visible = True
+
+        # NOW safe to delete non-deform bones
+        to_remove = [b for b in edit_bones if not b.use_deform]
+        for b in to_remove:
+            edit_bones.remove(b)
+
+        # 4. Pose mode – add clean constraints
+        bpy.ops.object.mode_set(mode='POSE')
+
+        for pbone in game_rig.pose.bones:
+            while pbone.constraints:
+                pbone.constraints.remove(pbone.constraints[0])
+
+            if self.constraint_type == 'TRANSFORM':
+                c = pbone.constraints.new('COPY_TRANSFORMS')
+                c.target = control
+                c.subtarget = pbone.name
+            else:
+                c = pbone.constraints.new('COPY_LOCATION')
+                c.target = control
+                c.subtarget = pbone.name
+
+                c = pbone.constraints.new('COPY_ROTATION')
+                c.target = control
+                c.subtarget = pbone.name
+
+        # 5. Bind meshes
+        if self.bind_meshes:
+            for obj in bpy.data.objects:
+                for mod in obj.modifiers:
+                    if mod.type == 'ARMATURE' and mod.object == control:
+                        mod.object = game_rig
+                        mat = obj.matrix_world.copy()
+                        obj.parent = game_rig
+                        obj.matrix_world = mat
+
+        bpy.ops.object.mode_set(mode='OBJECT')
+        game_rig.select_set(True)
+        context.view_layer.objects.active = game_rig
+
+        for area in context.screen.areas:
+            area.tag_redraw()
+
+        self.report({'INFO'}, f"Custom Game Rig generated safely → {game_rig.name}")
+        return {'FINISHED'}
+
 
 class LIVEOFFSET_PT_panel(Panel):
     bl_label = "Live Offset"
@@ -4419,6 +4606,18 @@ class ANIMSHORTCUTS_PT_panel(Panel):
                 icon='SORTALPHA',
             )
 
+            # ========== NEW SAFE BUTTON ==========
+            col.separator()
+            col.separator()
+            safe = col.column(align=True)
+            safe.scale_y = 1.5
+            safe.operator(
+                "animshortcuts.generate_custom_game_rig",
+                text="Generate Custom Game Rig",
+                icon='OUTLINER_OB_ARMATURE',
+            )
+            safe.label(text="Safe: clears constraints before deleting non-deform bones", icon='INFO')
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Registration
@@ -4473,7 +4672,8 @@ classes = (
     ANIMSHORTCUTS_OT_grt_enable_with_prefix,
     ANIMSHORTCUTS_OT_grt_disable_with_prefix,
     ANIMSHORTCUTS_OT_grt_set_baked_name,
-
+    # NEW safe generator
+    ANIMSHORTCUTS_OT_generate_custom_game_rig,
     LIVEOFFSET_PT_panel,
     TRANSFORMSHORTCUTS_PT_panel,
     ANIMSHORTCUTS_PT_panel,
