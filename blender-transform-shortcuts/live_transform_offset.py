@@ -1,6 +1,6 @@
 import bpy
 from bpy.types import Panel, Operator, PropertyGroup
-from bpy.props import FloatVectorProperty, BoolProperty, FloatProperty, EnumProperty, IntProperty
+from bpy.props import FloatVectorProperty, BoolProperty, FloatProperty, EnumProperty, IntProperty, StringProperty, CollectionProperty
 from bpy.app.handlers import persistent
 import json
 import math
@@ -3983,17 +3983,98 @@ class ANIMSHORTCUTS_OT_grt_set_baked_name(Operator):
         self.report({"INFO"}, f"Set local baked name on {count} entry(ies)")
         return {"FINISHED"}
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Hierarchy Rules – Custom Game Rig (per starting bone)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class ANIMSHORTCUTS_PG_hierarchy_rule(PropertyGroup):
+    """Rule that applies a hierarchy mode from a starting bone downward."""
+    starting_bone: StringProperty(
+        name="Starting Bone",
+        description="Root bone of this rule. The bone and all its descendants receive the hierarchy mode. Later rules override earlier ones.",
+        default="",
+    )
+    hierarchy_mode: EnumProperty(
+        name="Hierarchy",
+        items=[
+            ('KEEP_EXISTING', "Keep Existing", "Keep current parent hierarchy"),
+            ('FLAT', "Flat", "Unparent everything under this starting bone"),
+            ('RIGIFY', "Rigify Fix", "Re-parent deform bones to the nearest deform parent (Rigify-style)"),
+        ],
+        default='KEEP_EXISTING',
+    )
+    enabled: BoolProperty(
+        name="Enabled",
+        default=True,
+    )
+
+
+class ANIMSHORTCUTS_UL_hierarchy_rules(bpy.types.UIList):
+    def draw_item(self, context, layout, data, item, icon, active_data, active_propname, index):
+        if self.layout_type in {'DEFAULT', 'COMPACT'}:
+            row = layout.row(align=True)
+            row.prop(item, "enabled", text="")
+            row.prop(item, "starting_bone", text="", emboss=False)
+            row.prop(item, "hierarchy_mode", text="")
+        elif self.layout_type == 'GRID':
+            layout.alignment = 'CENTER'
+            layout.label(text="", icon='BONE_DATA')
+
+
+class ANIMSHORTCUTS_OT_hierarchy_rule_add(Operator):
+    bl_idname = "animshortcuts.hierarchy_rule_add"
+    bl_label = "Add Hierarchy Rule"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        rules = context.window_manager.anim_shortcuts_hierarchy_rules
+        item = rules.add()
+        item.starting_bone = ""
+        item.hierarchy_mode = 'KEEP_EXISTING'
+        context.window_manager.anim_shortcuts_hierarchy_rules_index = len(rules) - 1
+        return {'FINISHED'}
+
+
+class ANIMSHORTCUTS_OT_hierarchy_rule_remove(Operator):
+    bl_idname = "animshortcuts.hierarchy_rule_remove"
+    bl_label = "Remove Hierarchy Rule"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        rules = context.window_manager.anim_shortcuts_hierarchy_rules
+        idx = context.window_manager.anim_shortcuts_hierarchy_rules_index
+        if 0 <= idx < len(rules):
+            rules.remove(idx)
+            context.window_manager.anim_shortcuts_hierarchy_rules_index = max(0, idx - 1)
+        return {'FINISHED'}
+
+
+class ANIMSHORTCUTS_OT_hierarchy_rule_move(Operator):
+    bl_idname = "animshortcuts.hierarchy_rule_move"
+    bl_label = "Move Hierarchy Rule"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    direction: EnumProperty(items=[('UP', "Up", ""), ('DOWN', "Down", "")])
+
+    def execute(self, context):
+        rules = context.window_manager.anim_shortcuts_hierarchy_rules
+        idx = context.window_manager.anim_shortcuts_hierarchy_rules_index
+        new_idx = idx - 1 if self.direction == 'UP' else idx + 1
+        if 0 <= new_idx < len(rules):
+            rules.move(idx, new_idx)
+            context.window_manager.anim_shortcuts_hierarchy_rules_index = new_idx
+        return {'FINISHED'}
+
 class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
-    """Generate a clean Game Rig safely.
-    Clears all constraints BEFORE deleting non-deform bones.
-    This prevents the incomplete / broken state that the standard
-    Game Rig Tools Generate can leave on complex custom rigs."""
+    """Generate a clean Game Rig with per-starting-bone hierarchy rules.
+    Later rules override earlier ones."""
     bl_idname = "animshortcuts.generate_custom_game_rig"
     bl_label = "Generate Custom Game Rig"
     bl_options = {'REGISTER', 'UNDO'}
 
+    # Fallback for any bone not covered by a rule
     hierarchy_mode: EnumProperty(
-        name="Hierarchy",
+        name="Default Hierarchy",
         items=[
             ('KEEP_EXISTING', "Keep Existing", "Keep current parent hierarchy"),
             ('FLAT', "Flat", "Unparent everything"),
@@ -4014,21 +4095,43 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
     bind_meshes: BoolProperty(name="Bind Meshes to Game Rig", default=True)
 
     def invoke(self, context, event):
-        return context.window_manager.invoke_props_dialog(self, width=360)
+        return context.window_manager.invoke_props_dialog(self, width=440)
 
     def draw(self, context):
         layout = self.layout
+        wm = context.window_manager
+
+        # Hierarchy Rules list
+        box = layout.box()
+        box.label(text="Hierarchy Rules (later rules override earlier)", icon='OUTLINER_OB_ARMATURE')
+
+        row = box.row()
+        row.template_list(
+            "ANIMSHORTCUTS_UL_hierarchy_rules", "",
+            wm, "anim_shortcuts_hierarchy_rules",
+            wm, "anim_shortcuts_hierarchy_rules_index",
+            rows=5,
+        )
+        col = row.column(align=True)
+        col.operator("animshortcuts.hierarchy_rule_add", icon='ADD', text="")
+        col.operator("animshortcuts.hierarchy_rule_remove", icon='REMOVE', text="")
+        col.separator()
+        col.operator("animshortcuts.hierarchy_rule_move", icon='TRIA_UP', text="").direction = 'UP'
+        col.operator("animshortcuts.hierarchy_rule_move", icon='TRIA_DOWN', text="").direction = 'DOWN'
+
         layout.prop(self, "hierarchy_mode")
+        layout.separator()
         layout.prop(self, "constraint_type")
         layout.prop(self, "disconnect_bones")
         layout.prop(self, "remove_bbone")
         layout.prop(self, "bind_meshes")
-        layout.separator()
-        box = layout.box()
-        box.label(text="Safe generation order:", icon='INFO')
-        box.label(text="1. Clear all constraints first")
-        box.label(text="2. Delete non-deform bones")
-        box.label(text="3. Add clean inter-armature constraints")
+
+        info = layout.box()
+        info.label(text="How it works:", icon='INFO')
+        info.label(text="• Add rules and set a Starting Bone")
+        info.label(text="• That bone + all children get the chosen hierarchy")
+        info.label(text="• Later rules override earlier ones")
+        info.label(text="• Default Hierarchy is used for unmatched bones")
 
     def execute(self, context):
         if not _grt_available(context):
@@ -4043,9 +4146,8 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
             self.report({'ERROR'}, "Set a valid Control Rig in the Game Rig Tools panel first")
             return {'CANCELLED'}
 
-        # 1. Get or create the game rig
+        # 1. Get or create game rig
         game_rig = settings.Target_Armature
-
         if not game_rig or game_rig == control:
             game_rig = control.copy()
             game_rig.name = control.name + "_deform"
@@ -4063,12 +4165,11 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
         control.hide_set(False)
         control.hide_viewport = False
 
-        # 2. CRITICAL – clear ALL constraints FIRST
+        # 2. Clear all constraints first
         bpy.ops.object.mode_set(mode='OBJECT')
         bpy.ops.object.select_all(action='DESELECT')
         game_rig.select_set(True)
         context.view_layer.objects.active = game_rig
-
         bpy.ops.object.mode_set(mode='POSE')
 
         for pbone in game_rig.pose.bones:
@@ -4084,27 +4185,57 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
         if game_rig.data.animation_data:
             game_rig.data.animation_data_clear()
 
-        # 3. Edit mode – hierarchy + remove non-deform bones
+        # 3. Edit mode – apply hierarchy rules
         bpy.ops.object.mode_set(mode='EDIT')
         edit_bones = game_rig.data.edit_bones
 
-        if self.hierarchy_mode == 'FLAT':
-            for bone in edit_bones:
-                bone.parent = None
-        elif self.hierarchy_mode == 'RIGIFY':
-            for bone in list(edit_bones):
-                if bone.use_deform and bone.parent and not bone.parent.use_deform:
-                    p = bone.parent
-                    while p:
-                        if p.use_deform:
-                            bone.parent = p
-                            break
-                        def_name = p.name.replace("ORG-", "DEF-").replace("MCH-", "DEF-")
-                        candidate = edit_bones.get(def_name)
-                        if candidate and candidate.use_deform:
-                            bone.parent = candidate
-                            break
-                        p = p.parent
+        def get_descendants(root_name):
+            result = set()
+            root = edit_bones.get(root_name)
+            if not root:
+                return result
+            stack = [root]
+            while stack:
+                b = stack.pop()
+                result.add(b.name)
+                stack.extend(b.children)
+            return result
+
+        # Build final mode per bone (default first, then rules in order – later wins)
+        bone_mode = {b.name: self.hierarchy_mode for b in edit_bones}
+
+        for rule in context.window_manager.anim_shortcuts_hierarchy_rules:
+            if not rule.enabled or not rule.starting_bone.strip():
+                continue
+            for bname in get_descendants(rule.starting_bone.strip()):
+                bone_mode[bname] = rule.hierarchy_mode
+
+        # Apply FLAT
+        for bname, mode in bone_mode.items():
+            if mode == 'FLAT':
+                bone = edit_bones.get(bname)
+                if bone:
+                    bone.parent = None
+
+        # Apply RIGIFY Fix
+        for bname, mode in bone_mode.items():
+            if mode != 'RIGIFY':
+                continue
+            bone = edit_bones.get(bname)
+            if not bone or not bone.use_deform:
+                continue
+            if bone.parent and not bone.parent.use_deform:
+                p = bone.parent
+                while p:
+                    if p.use_deform:
+                        bone.parent = p
+                        break
+                    def_name = p.name.replace("ORG-", "DEF-").replace("MCH-", "DEF-")
+                    candidate = edit_bones.get(def_name)
+                    if candidate and candidate.use_deform:
+                        bone.parent = candidate
+                        break
+                    p = p.parent
 
         if self.disconnect_bones:
             for bone in edit_bones:
@@ -4117,7 +4248,7 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
             if self.remove_bbone:
                 bone.bbone_segments = 1
 
-        # Collection
+        # Clean collections
         while len(game_rig.data.collections) > 0:
             game_rig.data.collections.remove(game_rig.data.collections[0])
         deform_coll = game_rig.data.collections.new("Deform")
@@ -4125,14 +4256,13 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
             deform_coll.assign(bone)
         deform_coll.is_visible = True
 
-        # NOW safe to delete non-deform bones
+        # Delete non-deform bones
         to_remove = [b for b in edit_bones if not b.use_deform]
         for b in to_remove:
             edit_bones.remove(b)
 
-        # 4. Pose mode – add clean constraints
+        # 4. Add constraints
         bpy.ops.object.mode_set(mode='POSE')
-
         for pbone in game_rig.pose.bones:
             while pbone.constraints:
                 pbone.constraints.remove(pbone.constraints[0])
@@ -4145,7 +4275,6 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
                 c = pbone.constraints.new('COPY_LOCATION')
                 c.target = control
                 c.subtarget = pbone.name
-
                 c = pbone.constraints.new('COPY_ROTATION')
                 c.target = control
                 c.subtarget = pbone.name
@@ -4167,9 +4296,8 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
         for area in context.screen.areas:
             area.tag_redraw()
 
-        self.report({'INFO'}, f"Custom Game Rig generated safely → {game_rig.name}")
+        self.report({'INFO'}, f"Custom Game Rig generated → {game_rig.name}")
         return {'FINISHED'}
-
 
 class LIVEOFFSET_PT_panel(Panel):
     bl_label = "Live Offset"
@@ -4674,6 +4802,11 @@ classes = (
     ANIMSHORTCUTS_OT_grt_set_baked_name,
     # NEW safe generator
     ANIMSHORTCUTS_OT_generate_custom_game_rig,
+    ANIMSHORTCUTS_PG_hierarchy_rule,
+    ANIMSHORTCUTS_UL_hierarchy_rules,
+    ANIMSHORTCUTS_OT_hierarchy_rule_add,
+    ANIMSHORTCUTS_OT_hierarchy_rule_remove,
+    ANIMSHORTCUTS_OT_hierarchy_rule_move,
     LIVEOFFSET_PT_panel,
     TRANSFORMSHORTCUTS_PT_panel,
     ANIMSHORTCUTS_PT_panel,
@@ -4687,6 +4820,9 @@ def register():
         except ValueError:
             bpy.utils.unregister_class(cls)
             bpy.utils.register_class(cls)
+
+    bpy.types.WindowManager.anim_shortcuts_hierarchy_rules = CollectionProperty(type=ANIMSHORTCUTS_PG_hierarchy_rule)
+    bpy.types.WindowManager.anim_shortcuts_hierarchy_rules_index = IntProperty(default=0)
 
     if not hasattr(bpy.types.WindowManager, "live_offset_settings"):
         bpy.types.WindowManager.live_offset_settings = bpy.props.PointerProperty(type=LIVEOFFSET_PG_settings)
@@ -4702,6 +4838,10 @@ def register():
 
 
 def unregister():
+
+    del bpy.types.WindowManager.anim_shortcuts_hierarchy_rules_index
+    del bpy.types.WindowManager.anim_shortcuts_hierarchy_rules
+
     if _on_depsgraph_update in bpy.app.handlers.depsgraph_update_post:
         bpy.app.handlers.depsgraph_update_post.remove(_on_depsgraph_update)
 
