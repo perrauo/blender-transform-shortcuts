@@ -3,6 +3,7 @@ from bpy.types import Panel, Operator, PropertyGroup
 from bpy.props import FloatVectorProperty, BoolProperty, FloatProperty, EnumProperty, IntProperty, StringProperty, CollectionProperty
 from bpy.app.handlers import persistent
 import json
+import os
 import math
 import difflib
 from collections import defaultdict
@@ -3840,6 +3841,48 @@ class ANIMSHORTCUTS_PG_grt(PropertyGroup):
                     "(e.g. 'BAKED_' → BAKED_MyAction)",
         default="BAKED_",
     )
+    # Custom Game Rig generator defaults / last-used settings
+    hierarchy_mode: EnumProperty(
+        name="Default Hierarchy",
+        items=[
+            ('KEEP_EXISTING', "Keep Existing", "Keep current parent hierarchy"),
+            ('FLAT', "Flat", "Unparent everything"),
+            ('RIGIFY', "Rigify Fix", "Try to fix Rigify-style hierarchy"),
+        ],
+        default='KEEP_EXISTING',
+    )
+    constraint_type: EnumProperty(
+        name="Constraint",
+        items=[
+            ('LOTROT', "Loc + Rot", "Copy Location + Copy Rotation"),
+            ('TRANSFORM', "Copy Transforms", "Full Copy Transforms"),
+        ],
+        default='LOTROT',
+    )
+    disconnect_bones: BoolProperty(name="Disconnect Bones", default=True)
+    remove_bbone: BoolProperty(name="Remove BBone", default=True)
+    bind_meshes: BoolProperty(name="Bind Meshes to Game Rig", default=True)
+    preset_name: StringProperty(
+        name="Preset Name",
+        description="Name used when saving the current Custom Game Rig settings as a preset",
+        default="My Game Rig",
+    )
+    hierarchy_bone_prefix: StringProperty(
+        name="Bone Prefix",
+        description="Prefix used to auto-add hierarchy rules for top-level matching bones "
+                    "(e.g. 'DEF-'). A bone is top-level if it matches and its parent does not",
+        default="DEF-",
+    )
+    hierarchy_rule_mode: EnumProperty(
+        name="Rule Hierarchy",
+        description="Hierarchy mode assigned to each rule created from the bone prefix",
+        items=[
+            ('KEEP_EXISTING', "Keep Existing", "Keep current parent hierarchy"),
+            ('FLAT', "Flat", "Unparent everything under this starting bone"),
+            ('RIGIFY', "Rigify Fix", "Re-parent deform bones to the nearest deform parent (Rigify-style)"),
+        ],
+        default='KEEP_EXISTING',
+    )
 
 
 
@@ -4065,6 +4108,348 @@ class ANIMSHORTCUTS_OT_hierarchy_rule_move(Operator):
             context.window_manager.anim_shortcuts_hierarchy_rules_index = new_idx
         return {'FINISHED'}
 
+
+def _grt_control_armature(context):
+    """Prefer Game Rig Tools Source_Armature, else active armature."""
+    if _grt_available(context):
+        settings = getattr(context.scene, "GRT_Action_Bakery_Global_Settings", None)
+        if settings is not None:
+            arm = getattr(settings, "Source_Armature", None)
+            if arm is not None and arm.type == 'ARMATURE':
+                return arm
+    obj = context.active_object
+    if obj is not None and obj.type == 'ARMATURE':
+        return obj
+    return None
+
+
+def _top_level_bones_with_prefix(armature, prefix):
+    """Return names of bones that match *prefix* and have no matching ancestor.
+
+    Matching uses startswith (e.g. 'DEF-'). A bone is top-level only when it
+    matches and *no* parent/grandparent/... also matches — so a DEF- child
+    under a non-DEF intermediate that still sits under a DEF- ancestor is
+    excluded.
+    """
+    if not prefix:
+        return []
+    bones = armature.data.bones
+    matching = {b.name for b in bones if b.name.startswith(prefix)}
+    top = []
+    for name in matching:
+        bone = bones[name]
+        ancestor = bone.parent
+        under_matching_ancestor = False
+        while ancestor is not None:
+            if ancestor.name in matching:
+                under_matching_ancestor = True
+                break
+            ancestor = ancestor.parent
+        if not under_matching_ancestor:
+            top.append(name)
+    top.sort()
+    return top
+
+
+class ANIMSHORTCUTS_OT_hierarchy_rule_add_by_prefix(Operator):
+    """Add hierarchy rules for every top-level bone whose name starts with the prefix.
+
+    Example: prefix 'DEF-' adds one rule per highest DEF- bone in the control
+    armature (top-level = matches prefix and no ancestor matches).
+    Existing rules with the same starting bone are skipped.
+    """
+    bl_idname = "animshortcuts.hierarchy_rule_add_by_prefix"
+    bl_label = "Add Top-Level Bones by Prefix"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        grt = context.window_manager.anim_shortcuts_grt
+        prefix = (grt.hierarchy_bone_prefix or "").strip()
+        if not prefix:
+            self.report({'WARNING'}, "Bone prefix is empty")
+            return {'CANCELLED'}
+
+        arm = _grt_control_armature(context)
+        if arm is None:
+            self.report(
+                {'ERROR'},
+                "No control armature found. Set Source Armature in Game Rig Tools "
+                "or select an armature",
+            )
+            return {'CANCELLED'}
+
+        top_bones = _top_level_bones_with_prefix(arm, prefix)
+        if not top_bones:
+            self.report(
+                {'WARNING'},
+                f"No top-level bones starting with '{prefix}' on {arm.name}",
+            )
+            return {'CANCELLED'}
+
+        rules = context.window_manager.anim_shortcuts_hierarchy_rules
+        existing = {r.starting_bone for r in rules}
+        mode = grt.hierarchy_rule_mode
+        added = 0
+        for name in top_bones:
+            if name in existing:
+                continue
+            item = rules.add()
+            item.starting_bone = name
+            item.hierarchy_mode = mode
+            item.enabled = True
+            existing.add(name)
+            added += 1
+
+        if added:
+            context.window_manager.anim_shortcuts_hierarchy_rules_index = len(rules) - 1
+
+        skipped = len(top_bones) - added
+        msg = f"Added {added} hierarchy rule(s) from prefix '{prefix}' on {arm.name}"
+        if skipped:
+            msg += f" ({skipped} already present)"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Custom Game Rig – JSON Presets
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _grt_presets_dir():
+    """Return (and create) the folder used for Custom Game Rig JSON presets."""
+    base = bpy.utils.user_resource('SCRIPTS', path="presets")
+    folder = os.path.join(base, "anim_shortcuts", "game_rig")
+    os.makedirs(folder, exist_ok=True)
+    return folder
+
+
+def _grt_preset_path(name):
+    safe = "".join(c if c.isalnum() or c in ("-", "_", " ") else "_" for c in name).strip()
+    if not safe:
+        safe = "preset"
+    return os.path.join(_grt_presets_dir(), f"{safe}.json")
+
+
+def _grt_list_presets():
+    folder = _grt_presets_dir()
+    names = []
+    try:
+        for fn in os.listdir(folder):
+            if fn.lower().endswith(".json"):
+                names.append(os.path.splitext(fn)[0])
+    except OSError:
+        pass
+    return sorted(names, key=str.lower)
+
+
+def _grt_collect_preset_data(context):
+    """Serialize current Custom Game Rig settings + hierarchy rules."""
+    grt = context.window_manager.anim_shortcuts_grt
+    rules = context.window_manager.anim_shortcuts_hierarchy_rules
+    return {
+        "version": 1,
+        "type": "anim_shortcuts_custom_game_rig",
+        "hierarchy_mode": grt.hierarchy_mode,
+        "constraint_type": grt.constraint_type,
+        "disconnect_bones": bool(grt.disconnect_bones),
+        "remove_bbone": bool(grt.remove_bbone),
+        "bind_meshes": bool(grt.bind_meshes),
+        "hierarchy_rules": [
+            {
+                "starting_bone": r.starting_bone,
+                "hierarchy_mode": r.hierarchy_mode,
+                "enabled": bool(r.enabled),
+            }
+            for r in rules
+        ],
+    }
+
+
+def _grt_apply_preset_data(context, data):
+    """Apply a preset dict to WindowManager settings."""
+    if not isinstance(data, dict):
+        raise ValueError("Preset root must be a JSON object")
+
+    grt = context.window_manager.anim_shortcuts_grt
+    rules = context.window_manager.anim_shortcuts_hierarchy_rules
+
+    for key in ("hierarchy_mode", "constraint_type"):
+        if key in data and data[key] is not None:
+            try:
+                setattr(grt, key, data[key])
+            except TypeError:
+                pass
+
+    for key in ("disconnect_bones", "remove_bbone", "bind_meshes"):
+        if key in data:
+            setattr(grt, key, bool(data[key]))
+
+    if "hierarchy_rules" in data:
+        rules.clear()
+        for entry in data["hierarchy_rules"] or []:
+            if not isinstance(entry, dict):
+                continue
+            item = rules.add()
+            item.starting_bone = entry.get("starting_bone", "") or ""
+            mode = entry.get("hierarchy_mode", "KEEP_EXISTING")
+            try:
+                item.hierarchy_mode = mode
+            except TypeError:
+                item.hierarchy_mode = 'KEEP_EXISTING'
+            item.enabled = bool(entry.get("enabled", True))
+        context.window_manager.anim_shortcuts_hierarchy_rules_index = max(0, len(rules) - 1)
+
+
+def _grt_preset_enum_items(self, context):
+    items = [(n, n, f"Load preset '{n}'") for n in _grt_list_presets()]
+    if not items:
+        items = [("__NONE__", "(no presets)", "No saved presets found")]
+    return items
+
+
+class ANIMSHORTCUTS_OT_grt_save_preset(Operator):
+    """Save current Custom Game Rig settings and hierarchy rules to a JSON preset"""
+    bl_idname = "animshortcuts.grt_save_preset"
+    bl_label = "Save Game Rig Preset"
+    bl_options = {'REGISTER'}
+
+    preset_name: StringProperty(
+        name="Preset Name",
+        description="Filename (without extension) for the JSON preset",
+        default="My Game Rig",
+    )
+    filepath: StringProperty(subtype='FILE_PATH', options={'SKIP_SAVE', 'HIDDEN'})
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+
+    def invoke(self, context, event):
+        grt = context.window_manager.anim_shortcuts_grt
+        self.preset_name = grt.preset_name or "My Game Rig"
+        # Prefer named preset in the dedicated folder; still allow full path via file browser
+        self.filepath = _grt_preset_path(self.preset_name)
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def execute(self, context):
+        name = (self.preset_name or "").strip()
+        path = self.filepath
+        if not path:
+            if not name:
+                self.report({'ERROR'}, "Preset name is empty")
+                return {'CANCELLED'}
+            path = _grt_preset_path(name)
+        elif not path.lower().endswith(".json"):
+            path = path + ".json"
+
+        data = _grt_collect_preset_data(context)
+        data["name"] = name or os.path.splitext(os.path.basename(path))[0]
+
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except OSError as e:
+            self.report({'ERROR'}, f"Could not write preset: {e}")
+            return {'CANCELLED'}
+
+        # Keep panel name in sync
+        context.window_manager.anim_shortcuts_grt.preset_name = data["name"]
+        self.report({'INFO'}, f"Saved Game Rig preset → {path}")
+        return {'FINISHED'}
+
+
+class ANIMSHORTCUTS_OT_grt_load_preset(Operator):
+    """Load Custom Game Rig settings and hierarchy rules from a JSON preset"""
+    bl_idname = "animshortcuts.grt_load_preset"
+    bl_label = "Load Game Rig Preset"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    filepath: StringProperty(subtype='FILE_PATH', options={'SKIP_SAVE', 'HIDDEN'})
+    filter_glob: StringProperty(default="*.json", options={'HIDDEN'})
+    preset_enum: EnumProperty(
+        name="Preset",
+        description="Choose a previously saved preset",
+        items=_grt_preset_enum_items,
+    )
+
+    def invoke(self, context, event):
+        # Prefer named presets when available; otherwise jump straight to file browser
+        if _grt_list_presets():
+            return context.window_manager.invoke_props_dialog(self, width=320)
+        self.filepath = _grt_presets_dir() + os.sep
+        context.window_manager.fileselect_add(self)
+        return {'RUNNING_MODAL'}
+
+    def draw(self, context):
+        layout = self.layout
+        layout.label(text="Select a saved preset:")
+        layout.prop(self, "preset_enum", text="")
+        layout.separator()
+        layout.label(text="Tip: leave dialog and use Save to create presets.", icon='INFO')
+
+    def execute(self, context):
+        # File browser path takes priority when present
+        if self.filepath and os.path.isfile(self.filepath):
+            path = self.filepath
+        elif self.preset_enum and self.preset_enum != "__NONE__":
+            path = _grt_preset_path(self.preset_enum)
+        else:
+            self.report({'WARNING'}, "No preset selected")
+            return {'CANCELLED'}
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError) as e:
+            self.report({'ERROR'}, f"Could not read preset: {e}")
+            return {'CANCELLED'}
+
+        try:
+            _grt_apply_preset_data(context, data)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+
+        name = data.get("name") or os.path.splitext(os.path.basename(path))[0]
+        context.window_manager.anim_shortcuts_grt.preset_name = name
+        self.report({'INFO'}, f"Loaded Game Rig preset ← {path}")
+        return {'FINISHED'}
+
+
+class ANIMSHORTCUTS_OT_grt_delete_preset(Operator):
+    """Delete a named Custom Game Rig JSON preset from the presets folder"""
+    bl_idname = "animshortcuts.grt_delete_preset"
+    bl_label = "Delete Game Rig Preset"
+    bl_options = {'REGISTER'}
+
+    preset_enum: EnumProperty(
+        name="Preset",
+        items=_grt_preset_enum_items,
+    )
+
+    def invoke(self, context, event):
+        if not _grt_list_presets():
+            self.report({'WARNING'}, "No presets to delete")
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=320)
+
+    def draw(self, context):
+        self.layout.prop(self, "preset_enum", text="")
+
+    def execute(self, context):
+        if not self.preset_enum or self.preset_enum == "__NONE__":
+            self.report({'WARNING'}, "No preset selected")
+            return {'CANCELLED'}
+        path = _grt_preset_path(self.preset_enum)
+        try:
+            os.remove(path)
+        except OSError as e:
+            self.report({'ERROR'}, f"Could not delete preset: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Deleted preset '{self.preset_enum}'")
+        return {'FINISHED'}
+
+
 class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
     """Generate a clean Game Rig with per-starting-bone hierarchy rules.
     Later rules override earlier ones."""
@@ -4095,6 +4480,13 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
     bind_meshes: BoolProperty(name="Bind Meshes to Game Rig", default=True)
 
     def invoke(self, context, event):
+        # Seed dialog from last-used / preset defaults stored on the WindowManager
+        grt = context.window_manager.anim_shortcuts_grt
+        self.hierarchy_mode = grt.hierarchy_mode
+        self.constraint_type = grt.constraint_type
+        self.disconnect_bones = grt.disconnect_bones
+        self.remove_bbone = grt.remove_bbone
+        self.bind_meshes = grt.bind_meshes
         return context.window_manager.invoke_props_dialog(self, width=440)
 
     def draw(self, context):
@@ -4118,6 +4510,20 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
         col.separator()
         col.operator("animshortcuts.hierarchy_rule_move", icon='TRIA_UP', text="").direction = 'UP'
         col.operator("animshortcuts.hierarchy_rule_move", icon='TRIA_DOWN', text="").direction = 'DOWN'
+
+        grt = wm.anim_shortcuts_grt
+        prefix_row = box.row(align=True)
+        prefix_row.prop(grt, "hierarchy_bone_prefix", text="Prefix")
+        prefix_row.prop(grt, "hierarchy_rule_mode", text="")
+        box.operator(
+            "animshortcuts.hierarchy_rule_add_by_prefix",
+            text="Add Top-Level Bones by Prefix",
+            icon='BONE_DATA',
+        )
+        box.label(
+            text="Adds one rule per highest bone starting with the prefix",
+            icon='INFO',
+        )
 
         layout.prop(self, "hierarchy_mode")
         layout.separator()
@@ -4295,6 +4701,15 @@ class ANIMSHORTCUTS_OT_generate_custom_game_rig(Operator):
 
         for area in context.screen.areas:
             area.tag_redraw()
+
+
+        # Remember last-used settings for presets / next dialog
+        grt = context.window_manager.anim_shortcuts_grt
+        grt.hierarchy_mode = self.hierarchy_mode
+        grt.constraint_type = self.constraint_type
+        grt.disconnect_bones = self.disconnect_bones
+        grt.remove_bbone = self.remove_bbone
+        grt.bind_meshes = self.bind_meshes
 
         self.report({'INFO'}, f"Custom Game Rig generated → {game_rig.name}")
         return {'FINISHED'}
@@ -4526,14 +4941,27 @@ class ANIMSHORTCUTS_PT_panel(Panel):
         obj = context.active_object
         settings = context.window_manager.anim_shortcuts_settings
 
-        if not obj or obj.type != 'ARMATURE':
-            layout.label(text="Select an Armature", icon='ERROR')
-            return
-        if obj.mode != 'POSE':
-            layout.label(text="Switch to Pose Mode", icon='ERROR')
-            return
-        if not obj.animation_data or not obj.animation_data.action:
-            layout.label(text="No active Action", icon='ERROR')
+        # Animation tools need an armature in Pose mode with an active action.
+        # Game Rig Tools (drawn at the bottom) does not — keep that usable always.
+        anim_ok = (
+            obj is not None
+            and obj.type == 'ARMATURE'
+            and obj.mode == 'POSE'
+            and obj.animation_data is not None
+            and obj.animation_data.action is not None
+        )
+
+        if not anim_ok:
+            box = layout.box()
+            if not obj or obj.type != 'ARMATURE':
+                box.label(text="Select an Armature for animation tools", icon='INFO')
+            elif obj.mode != 'POSE':
+                box.label(text="Switch to Pose Mode for animation tools", icon='INFO')
+            else:
+                box.label(text="No active Action for animation tools", icon='INFO')
+            box.label(text="Game Rig Tools below still work.", icon='INFO')
+            layout.separator()
+            self._draw_game_rig_tools(context, layout)
             return
 
         # Auto-suggest half length when the preferred value is still the default
@@ -4698,53 +5126,102 @@ class ANIMSHORTCUTS_PT_panel(Panel):
         )
 
         # ── Game Rig Tools Helpers ──────────────────────────────────────────
+        self._draw_game_rig_tools(context, layout)
+
+    def _draw_game_rig_tools(self, context, layout):
+        """Game Rig Tools UI — usable without Pose mode / active action."""
         layout.separator()
         box = layout.box()
         box.label(text="Game Rig Tools", icon='ARMATURE_DATA')
 
         if not hasattr(context.scene, "GRT_Action_Bakery"):
             box.label(text="Game Rig Tools not loaded", icon='ERROR')
-        else:
-            grt = context.window_manager.anim_shortcuts_grt
-            col = box.column(align=True)
-            col.prop(grt, "action_bakery_prefix", text="Prefix")
+            return
 
-            row = col.row(align=True)
-            row.operator("animshortcuts.grt_add_with_prefix", icon='ADD')
-            row.operator("animshortcuts.grt_remove_with_prefix", icon='REMOVE')
+        grt = context.window_manager.anim_shortcuts_grt
+        col = box.column(align=True)
+        col.prop(grt, "action_bakery_prefix", text="Prefix")
 
-            col.separator()
-            row = col.row(align=True)
-            row.operator(
-                "animshortcuts.grt_enable_with_prefix",
-                text="Enable",
-                icon='CHECKBOX_HLT',
-            )
-            row.operator(
-                "animshortcuts.grt_disable_with_prefix",
-                text="Disable",
-                icon='CHECKBOX_DEHLT',
-            )
+        row = col.row(align=True)
+        row.operator("animshortcuts.grt_add_with_prefix", icon='ADD')
+        row.operator("animshortcuts.grt_remove_with_prefix", icon='REMOVE')
 
-            col.separator()
-            col.prop(grt, "baked_action_name", text="Baked Name")
-            col.operator(
-                "animshortcuts.grt_set_baked_name",
-                text="Set all baked names",
-                icon='SORTALPHA',
-            )
+        col.separator()
+        row = col.row(align=True)
+        row.operator(
+            "animshortcuts.grt_enable_with_prefix",
+            text="Enable",
+            icon='CHECKBOX_HLT',
+        )
+        row.operator(
+            "animshortcuts.grt_disable_with_prefix",
+            text="Disable",
+            icon='CHECKBOX_DEHLT',
+        )
 
-            # ========== NEW SAFE BUTTON ==========
-            col.separator()
-            col.separator()
-            safe = col.column(align=True)
-            safe.scale_y = 1.5
-            safe.operator(
-                "animshortcuts.generate_custom_game_rig",
-                text="Generate Custom Game Rig",
-                icon='OUTLINER_OB_ARMATURE',
-            )
-            safe.label(text="Safe: clears constraints before deleting non-deform bones", icon='INFO')
+        col.separator()
+        col.prop(grt, "baked_action_name", text="Baked Name")
+        col.operator(
+            "animshortcuts.grt_set_baked_name",
+            text="Set all baked names",
+            icon='SORTALPHA',
+        )
+
+        # ========== Custom Game Rig + Presets ==========
+        col.separator()
+        col.separator()
+        safe = col.column(align=True)
+        safe.label(text="Custom Game Rig", icon='OUTLINER_OB_ARMATURE')
+        safe.prop(grt, "hierarchy_mode", text="Default Hierarchy")
+        safe.prop(grt, "constraint_type", text="Constraint")
+        row = safe.row(align=True)
+        row.prop(grt, "disconnect_bones", toggle=True)
+        row.prop(grt, "remove_bbone", toggle=True)
+        safe.prop(grt, "bind_meshes")
+
+        safe.separator()
+        safe.label(text="Hierarchy Rules by Prefix")
+        row = safe.row(align=True)
+        row.prop(grt, "hierarchy_bone_prefix", text="Prefix")
+        row.prop(grt, "hierarchy_rule_mode", text="")
+        safe.operator(
+            "animshortcuts.hierarchy_rule_add_by_prefix",
+            text="Add Top-Level Bones by Prefix",
+            icon='BONE_DATA',
+        )
+
+        # Hierarchy rules list (editable outside Pose mode)
+        wm = context.window_manager
+        row = safe.row()
+        row.template_list(
+            "ANIMSHORTCUTS_UL_hierarchy_rules", "",
+            wm, "anim_shortcuts_hierarchy_rules",
+            wm, "anim_shortcuts_hierarchy_rules_index",
+            rows=4,
+        )
+        rcol = row.column(align=True)
+        rcol.operator("animshortcuts.hierarchy_rule_add", icon='ADD', text="")
+        rcol.operator("animshortcuts.hierarchy_rule_remove", icon='REMOVE', text="")
+        rcol.separator()
+        rcol.operator("animshortcuts.hierarchy_rule_move", icon='TRIA_UP', text="").direction = 'UP'
+        rcol.operator("animshortcuts.hierarchy_rule_move", icon='TRIA_DOWN', text="").direction = 'DOWN'
+
+        safe.separator()
+        safe.prop(grt, "preset_name", text="Preset")
+        row = safe.row(align=True)
+        row.operator("animshortcuts.grt_save_preset", text="Save", icon='FILE_TICK')
+        row.operator("animshortcuts.grt_load_preset", text="Load", icon='FILEBROWSER')
+        row.operator("animshortcuts.grt_delete_preset", text="", icon='TRASH')
+
+        safe.separator()
+        row = safe.row(align=True)
+        row.scale_y = 1.5
+        row.operator(
+            "animshortcuts.generate_custom_game_rig",
+            text="Generate Custom Game Rig",
+            icon='OUTLINER_OB_ARMATURE',
+        )
+        safe.label(text="Safe: clears constraints before deleting non-deform bones", icon='INFO')
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -4800,6 +5277,9 @@ classes = (
     ANIMSHORTCUTS_OT_grt_enable_with_prefix,
     ANIMSHORTCUTS_OT_grt_disable_with_prefix,
     ANIMSHORTCUTS_OT_grt_set_baked_name,
+    ANIMSHORTCUTS_OT_grt_save_preset,
+    ANIMSHORTCUTS_OT_grt_load_preset,
+    ANIMSHORTCUTS_OT_grt_delete_preset,
     # NEW safe generator
     ANIMSHORTCUTS_OT_generate_custom_game_rig,
     ANIMSHORTCUTS_PG_hierarchy_rule,
@@ -4807,6 +5287,7 @@ classes = (
     ANIMSHORTCUTS_OT_hierarchy_rule_add,
     ANIMSHORTCUTS_OT_hierarchy_rule_remove,
     ANIMSHORTCUTS_OT_hierarchy_rule_move,
+    ANIMSHORTCUTS_OT_hierarchy_rule_add_by_prefix,
     LIVEOFFSET_PT_panel,
     TRANSFORMSHORTCUTS_PT_panel,
     ANIMSHORTCUTS_PT_panel,
